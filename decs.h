@@ -57,6 +57,13 @@
 #include <omp.h>
 #endif
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#ifndef M_PI_2
+#define M_PI_2 1.57079632679489661923  // π / 2
+#endif
 /*************************************************************************
       COMPILE-TIME PARAMETERS : 
 *************************************************************************/
@@ -79,7 +86,7 @@
 #define SNDWAVE_TEST 7
 #define ENTWAVE_TEST 8
 
-#define WHICHPROBLEM TORUS_PROBLEM
+#define WHICHPROBLEM BONDI_PROBLEM_2D
 #define DOKTOT   1
 #define DOCYLINDRIFYCOORDS 0
 
@@ -122,7 +129,7 @@
 #define PERIODIC (0)          /* whether or not to use periodic boundary conditions */
 #define OUTFLOW  (0)          /* whether or not to use outflow boundary conditions in all directions */
 #elif WHICHPROBLEM == BONDI_PROBLEM_1D
-#define N1       (64)         /* number of physical zones in X1-direction */
+#define N1       (32)         /* number of physical zones in X1-direction */ //originally 64
 #define N2       (1)          /* number of physical zones in X2-direction */
 #define N3       (1)          /* number of physical zones in X3-direction */
 #define GR       (1)          /* whether or not to use GR */
@@ -131,8 +138,8 @@
 #define PERIODIC (0)          /* whether or not to use periodic boundary conditions */
 #define OUTFLOW  (0)          /* whether or not to use outflow boundary conditions in all directions */
 #elif WHICHPROBLEM == BONDI_PROBLEM_2D
-#define N1       (64)         /* number of physical zones in X1-direction */
-#define N2       (64)         /* number of physical zones in X2-direction */
+#define N1       (64)         /* number of physical zones in X1-direction */ //originally 64
+#define N2       (64)         /* number of physical zones in X2-direction */ //originally 64
 #define N3       (1)          /* number of physical zones in X3-direction */
 #define GR       (1)          /* whether or not to use GR */
 #define BL       (1)          /* whether or not to use BL coords */

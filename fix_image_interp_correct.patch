@@ -1,0 +1,33 @@
+--- a/image_interp.c
++++ b/image_interp.c
+@@ -38,10 +38,10 @@
+ #include <stdlib.h>
+ #include <math.h>
+ 
+-#define SMALL 	1.e-14 ;
++#define SMALL 	1.e-14
+ 
+ int oN1,oN2,nN1,nN2 ;
+-double dx1,dx2,rin,rout,dx,dy,hslope ;
++double dx1,dx2,rin,rout,delta_x,dy,hslope ;
+ 
+ int main(int argc, char *argv[])
+ {
+@@ -82,7 +82,7 @@ int main(int argc, char *argv[])
+ 	dx1 = x1max/oN1 ;
+ 	dx2 = 1./(double)oN2 ;
+ 
+-	dx = xmax/(double)nN1 ;
++	delta_x = xmax/(double)nN1 ;
+ 	dy = 2.*ymax/(double)nN2 ;
+ 
+ 	/* make arrays for images */
+@@ -174,7 +174,7 @@ void new_coord(int i,int j,double *r,double *th)
+ {
+ 	double x,y ;
+ 
+-	x = i*dx ;
++	x = i*delta_x ;
+ 	y = (j-nN2/2)*dy ;
+ 
+ 	*r = sqrt(x*x + y*y) ;

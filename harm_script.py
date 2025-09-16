@@ -1,6 +1,7 @@
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+from scipy.special import erf
 
 import sys
 from matplotlib import rc
@@ -55,13 +56,38 @@ import matplotlib.colors as colors
 #use_math_text = True
 
 
-def mathify_axes_ticks(ax,fontsize=20,xticks=None,yticks=None):
+# def mathify_axes_ticks(ax,fontsize=20,xticks=None,yticks=None):
+    # if xticks is None:
+        # xticks = ax.get_xticks()
+    # if yticks is None:
+        # yticks = ax.get_yticks()
+    # if ax.get_xscale() != 'log': ax.set_xticklabels([(r'$%g$' % lab) for lab in xticks])
+    # if ax.get_yscale() != 'log': ax.set_yticklabels([(r'$%g$' % lab) for lab in yticks])
+    # if fontsize is not None:
+        # if ax.get_xscale() != 'log':
+            # for label in ax.get_xticklabels():
+                # label.set_fontsize(fontsize)
+        # if ax.get_yscale() != 'log':
+            # for label in ax.get_yticklabels():
+                # label.set_fontsize(fontsize)
+
+def mathify_axes_ticks(ax, fontsize=20, xticks=None, yticks=None):
     if xticks is None:
         xticks = ax.get_xticks()
     if yticks is None:
         yticks = ax.get_yticks()
-    if ax.get_xscale() != 'log': ax.set_xticklabels([(r'$%g$' % lab) for lab in xticks])
-    if ax.get_yscale() != 'log': ax.set_yticklabels([(r'$%g$' % lab) for lab in yticks])
+
+    # Set ticks explicitly before setting labels
+    ax.set_xticks(xticks)
+    ax.set_yticks(yticks)
+
+    # Convert tick labels to LaTeX formatted strings
+    if ax.get_xscale() != 'log':
+        ax.set_xticklabels([r'$%g$' % lab for lab in xticks])
+    if ax.get_yscale() != 'log':
+        ax.set_yticklabels([r'$%g$' % lab for lab in yticks])
+
+    # Set font size for tick labels
     if fontsize is not None:
         if ax.get_xscale() != 'log':
             for label in ax.get_xticklabels():
@@ -1091,7 +1117,7 @@ delta = lambda kapa,nu: (kapa==nu)
 fTudEM = lambda kapa,nu: bsq*uu[kapa]*ud[nu] + 0.5*bsq*delta(kapa,nu) - bu[kapa]*bd[nu]
 fTudMA = lambda kapa,nu: (rho+gam*ug)*uu[kapa]*ud[nu]+(gam-1)*ug*delta(kapa,nu)
 fTud = lambda kapa,nu: fTudEM(kapa,nu) + fTudMA(kapa,nu)
-fRud = lambda kapa,nu: 4./3.*Erf*uradu[kapa]*uradd[nu]+1./3.*Erf*delta(kapa,nu)
+# fRud = lambda kapa,nu: 4./3.*Erf*uradu[kapa]*uradd[nu]+1./3.*Erf*delta(kapa,nu)  # temporarily commented out since there's no need for radiation in my hw
 
 def odot(a,b):
     """ Outer product of two vectors a^mu b_nu"""

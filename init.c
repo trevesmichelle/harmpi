@@ -640,6 +640,33 @@ void init_bondi()
 	double rho_av,rhomax,umax,beta,bsq_ij,bsq_max,norm,q,beta_act ;
 	double rmax, lfish_calc(double rmax) ;
 
+	// =================================================================
+	// SCENARIO CONFIGURATION - MODIFY THESE TO SWITCH BETWEEN CASES
+	// =================================================================
+	
+	// Set EXACTLY ONE of these to 1, others to 0
+	int PURE_BONDI = 0;                    // Pure spherical Bondi accretion
+	int BONDI_HOYLE_LYTTLETON = 0;         // Uniform wind case
+	int DENSITY_GRADIENT = 0;              // Global density gradient
+	int ANGULAR_MOMENTUM = 1;              // Small initial angular momentum
+	int RANDOM_VELOCITY = 0;               // Random velocity field
+	
+// Wind velocity parameter - recommended values:
+// Pure Bondi: 0.0 (academic case)
+// BHL: 0.1 (strong wind)
+// Density Gradient: 0.02-0.05 (ambient wind + gradient)
+// Angular Momentum: 0.02-0.05 (ambient wind + rotation)
+// Random Velocity: 0.02-0.05 (ambient wind + turbulence)
+  double v_wind = 0.0;
+
+// Other scenario parameters
+
+	double density_gradient_index = 1.5;   // Power law index for density gradient 
+	double omega_init_amplitude =  0.0001;    // Angular momentum strength (must be very small, otherwise instability breaks the simulation)
+	double turbulence_amplitude = 0.1;     // Random velocity amplitude
+	
+	// =================================================================
+
 	/* some physics parameters */
 	gam = 4./3. ;
 
@@ -654,8 +681,8 @@ void init_bondi()
         /* some numerical parameters */
         lim = MC ;
         failed = 0 ;	/* start slow */
-        cour = 0.9 ;
-        dt = 1.e-5 ;
+        cour = 0.3 ;  // original value 0.9
+        dt = 1.e-6 ;  // original value 1.e-5
 	rhor = (1. + sqrt(1. - a*a)) ;
 	R0 = -2*rhor ;
         Rin = 0.5*rhor ;
@@ -702,6 +729,14 @@ void init_bondi()
         rdump01_cnt = 0 ;
 	defcon = 1. ;
 
+	// Print which scenario is active
+	if(PURE_BONDI) fprintf(stderr,"Scenario: Pure Bondi accretion\n");
+	else if(BONDI_HOYLE_LYTTLETON) fprintf(stderr,"Scenario: Bondi-Hoyle-Lyttleton (v_wind=%.2f)\n", v_wind);
+	else if(DENSITY_GRADIENT) fprintf(stderr,"Scenario: Density gradient (index=%.2f)\n", density_gradient_index);
+	else if(ANGULAR_MOMENTUM) fprintf(stderr,"Scenario: Angular momentum (omega=%.3f)\n", omega_init_amplitude);
+	else if(RANDOM_VELOCITY) fprintf(stderr,"Scenario: Random velocity (amplitude=%.2f)\n", turbulence_amplitude);
+	else fprintf(stderr,"WARNING: No scenario selected or multiple scenarios active!\n");
+
 	rhomax = 0. ;
 	umax = 0. ;
 	ZSLOOP(0,N1-1,0,N2-1,0,N3-1) {
@@ -724,9 +759,23 @@ void init_bondi()
 			up = 0. ;
 			*/
 
+			// Initialize velocities based on selected scenario
 			ur = 0. ;
 			uh = 0. ;
 			up = 0. ;
+
+      // Apply scenario-specific modifications
+      if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT || ANGULAR_MOMENTUM || RANDOM_VELOCITY) {
+          uh = v_wind;  // Apply wind for all realistic scenarios
+      }
+
+      if(RANDOM_VELOCITY) {
+          // Add random velocity perturbations on top of baseline wind
+          double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
+          ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);
+          uh += turbulence_amplitude * (2.0 * fmod(rand_seed * 1.618, 1.0) - 0.5);
+          up += turbulence_amplitude * (2.0 * fmod(rand_seed * 2.718, 1.0) - 0.5);
+      }
 
 			/*
 			get_geometry(i,j,CENT,&geom) ;
@@ -743,10 +792,44 @@ void init_bondi()
 		}
 		/* region inside initial uniform density */
 		else { 
-		  rho = 1.;
+			// Base density and pressure
+			rho = 1.;
+			
+			// Apply density gradient if selected
+			if(DENSITY_GRADIENT) {
+				rho = 1. * pow(r/rin, -density_gradient_index);
+			}
+
 		  u = kappa*pow(rho,gam)/(gam - 1.) ;
-		  ur = 0. ;
-		  uh = 0. ;
+
+			// Initialize velocities
+			ur = 0. ;
+			uh = 0. ;
+			up = 0. ;
+
+      // Apply scenario-specific velocity modifications
+      if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT || ANGULAR_MOMENTUM || RANDOM_VELOCITY) {
+          uh = v_wind;  // Apply wind for all realistic scenarios
+      }
+
+      if(ANGULAR_MOMENTUM && r > 6.0) {  // Only apply rotation outside ISCO
+          double r_isco = 6.0;  // Conservative ISCO estimate for a=0.9375
+          // up = omega_init_amplitude * sqrt(r_isco/r) * sth;  // Keplerian profile
+          up = omega_init_amplitude * sth;  // Constant, not Keplerian
+
+      }
+
+      if(DENSITY_GRADIENT) {
+          ur = -0.01 / (r*r);  // Small pressure-driven inflow
+      }
+
+      if(RANDOM_VELOCITY) {
+          // Add random velocity perturbations on top of baseline wind
+          double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
+          ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);
+          uh += turbulence_amplitude * (2.0 * fmod(rand_seed * 1.618, 1.0) - 0.5);
+          up += turbulence_amplitude * (2.0 * fmod(rand_seed * 2.718, 1.0) - 0.5);
+      }
 
 
 		  p[i][j][k][RHO] = rho ;
@@ -769,6 +852,9 @@ void init_bondi()
 
 	fixup(p) ;
 	bound_prim(p) ;
+
+  // Print final summary
+	fprintf(stderr,"Setup complete: rhomax=%.2e, umax=%.2e\n", rhomax, umax);
     
 
 #if(0) //disable for now

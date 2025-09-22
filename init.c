@@ -648,8 +648,8 @@ void init_bondi()
 	int PURE_BONDI = 0;                    // Pure spherical Bondi accretion
 	int BONDI_HOYLE_LYTTLETON = 0;         // Uniform wind case
 	int DENSITY_GRADIENT = 0;              // Global density gradient
-	int ANGULAR_MOMENTUM = 1;              // Small initial angular momentum
-	int RANDOM_VELOCITY = 0;               // Random velocity field
+	int ANGULAR_MOMENTUM = 0;              // Small initial angular momentum
+	int RANDOM_VELOCITY = 1;               // Random velocity field
 	
 // Wind velocity parameter - recommended values:
 // Pure Bondi: 0.0 (academic case)
@@ -657,12 +657,12 @@ void init_bondi()
 // Density Gradient: 0.02-0.05 (ambient wind + gradient)
 // Angular Momentum: 0.02-0.05 (ambient wind + rotation)
 // Random Velocity: 0.02-0.05 (ambient wind + turbulence)
-  double v_wind = 0.0;
+  double v_wind = 0.05;
 
 // Other scenario parameters
 
 	double density_gradient_index = 1.5;   // Power law index for density gradient 
-	double omega_init_amplitude =  0.0001;    // Angular momentum strength (must be very small, otherwise instability breaks the simulation)
+	double omega_init_amplitude =  0.0;    // Angular momentum strength (must be small, otherwise instability breaks the simulation). set to 0.0 for other scenarios
 	double turbulence_amplitude = 0.1;     // Random velocity amplitude
 	
 	// =================================================================
@@ -681,8 +681,8 @@ void init_bondi()
         /* some numerical parameters */
         lim = MC ;
         failed = 0 ;	/* start slow */
-        cour = 0.3 ;  // original value 0.9
-        dt = 1.e-6 ;  // original value 1.e-5
+        cour = 0.9 ;  // original value 0.9
+        dt = 1.e-5 ;  // original value 1.e-5
 	rhor = (1. + sqrt(1. - a*a)) ;
 	R0 = -2*rhor ;
         Rin = 0.5*rhor ;
@@ -764,12 +764,25 @@ void init_bondi()
 			uh = 0. ;
 			up = 0. ;
 
-      // Apply scenario-specific modifications
-      if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT || ANGULAR_MOMENTUM || RANDOM_VELOCITY) {
-          uh = v_wind;  // Apply wind for all realistic scenarios
+      // Apply Bondi radial infall for scenarios that need it
+      if(PURE_BONDI || ANGULAR_MOMENTUM) {
+          ur = -0.01 / (r * r);  // Radial Bondi infall
+      }
+
+      // Apply wind only for BHL scenario  
+      if(BONDI_HOYLE_LYTTLETON) {
+          uh = v_wind;  // Wind velocity
+          ur = -0.01 / (r * r);  // Plus radial infall
+      }
+
+      if(DENSITY_GRADIENT) {
+          uh = v_wind;  // Apply ambient wind
+          ur = -0.01 / (r * r);  // Plus radial infall
       }
 
       if(RANDOM_VELOCITY) {
+          uh = v_wind;  // Add baseline wind first
+          ur = -0.01 / (r * r);  // Add baseline infall
           // Add random velocity perturbations on top of baseline wind
           double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
           ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);
@@ -792,13 +805,15 @@ void init_bondi()
 		}
 		/* region inside initial uniform density */
 		else { 
-			// Base density and pressure
-			rho = 1.;
-			
-			// Apply density gradient if selected
-			if(DENSITY_GRADIENT) {
-				rho = 1. * pow(r/rin, -density_gradient_index);
-			}
+      // Base density and pressure - use appropriate profile for each scenario
+      if(DENSITY_GRADIENT) {
+          rho = 1. * pow(r/rin, -density_gradient_index);  // Handle density gradient first
+      } else if(ANGULAR_MOMENTUM || PURE_BONDI) {
+          //rho = 1.0 * pow(r/rin, -1.5);  // r^(-3/2) profile like Bondi
+          rho = 1.0 * pow(r/rin, -0.3);  // Even gentler than -0.5
+      } else {
+          rho = 1.;  // Keep constant for other scenarios (BHL, random velocity)
+      }
 
 		  u = kappa*pow(rho,gam)/(gam - 1.) ;
 
@@ -807,9 +822,16 @@ void init_bondi()
 			uh = 0. ;
 			up = 0. ;
 
-      // Apply scenario-specific velocity modifications
-      if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT || ANGULAR_MOMENTUM || RANDOM_VELOCITY) {
-          uh = v_wind;  // Apply wind for all realistic scenarios
+      // Apply Bondi radial infall for scenarios that need it
+      if(PURE_BONDI || ANGULAR_MOMENTUM) {
+          //ur = -0.01 / (r * r);  // Radial Bondi infall
+          ur = -0.001 / (r * r);  // Much weaker inflow
+      }
+
+      // Apply wind only for BHL scenario  
+      if(BONDI_HOYLE_LYTTLETON) {
+          uh = v_wind;  // Wind velocity
+          ur = -0.01 / (r * r);  // Plus radial infall
       }
 
       if(ANGULAR_MOMENTUM && r > 6.0) {  // Only apply rotation outside ISCO
@@ -820,10 +842,13 @@ void init_bondi()
       }
 
       if(DENSITY_GRADIENT) {
-          ur = -0.01 / (r*r);  // Small pressure-driven inflow
+        uh = v_wind;  
+        ur = -0.01 / (r*r);  // Small pressure-driven inflow
       }
 
       if(RANDOM_VELOCITY) {
+          uh = v_wind;  // Add baseline wind first
+          ur = -0.01 / (r * r);  // Add baseline infall
           // Add random velocity perturbations on top of baseline wind
           double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
           ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);

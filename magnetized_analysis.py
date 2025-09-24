@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FIXED Magnetized Black Hole Analysis Script
-For HARM simulations of monopole and other magnetized problems
+Complete Magnetized Black Hole Analysis Script
+For HARM simulations - both 1D and 2D monopole problems
 """
 
 import harm_script as hs
@@ -148,16 +148,110 @@ class MagnetizedAnalysis:
         
         return results
     
+    def analyze_2d_monopole(self, dump_files, sample_every=5):
+        """Enhanced analysis for 2D BZ monopole problems"""
+        print("=== 2D BZ MONOPOLE ANALYSIS ===")
+        
+        results = {
+            'times': [],
+            'power_extraction': [],
+            'fast_surface_data': [],
+            'omega_theta_profiles': [],
+            'horizon_data': []
+        }
+        
+        for i, dump_file in enumerate(dump_files[::sample_every]):
+            try:
+                self.load_data("gdump", dump_file)
+                current_time = float(hs.t)
+                
+                print(f"Processing {dump_file}: t={current_time:.3f}")
+                
+                # Calculate auxiliary quantities
+                hs.aux()
+                
+                # Get 2D data
+                r_2d = hs.r.squeeze()
+                h_2d = hs.h.squeeze()  # theta coordinate
+                rho_2d = hs.rho.squeeze()
+                
+                # Power extraction analysis
+                if hasattr(hs, 'Tud'):
+                    # Energy flux: -g^(1/2) * T^r_t
+                    dEr = -hs.gdet * hs.Tud[1,0] * hs._dx2 * hs._dx3
+                    Er = dEr.sum(axis=-1) if dEr.ndim > 2 else dEr.sum(axis=1)  # Sum over phi
+                    
+                    # FIXED: Average over theta to get single radial profile
+                    if Er.ndim > 1:
+                        Er_avg = Er.mean(axis=1)  # Average over theta direction
+                    else:
+                        Er_avg = Er
+                    
+                    results['power_extraction'].append({
+                        'time': current_time,
+                        'energy_flux': Er_avg,
+                        'r_coord': r_2d[:,0] if r_2d.ndim > 1 else r_2d
+                    })
+                
+                # Fast surface analysis (where u^r = 0)
+                if hasattr(hs, 'uu'):
+                    ur = hs.uu[1].squeeze()
+                    results['fast_surface_data'].append({
+                        'time': current_time,
+                        'ur': ur,
+                        'r': r_2d,
+                        'h': h_2d,
+                        'rho': rho_2d
+                    })
+                
+                # ΩF/ΩH analysis at horizon
+                if hasattr(hs, 'omegaf2') and hasattr(hs, 'a'):
+                    omega_f = hs.omegaf2.squeeze()
+                    a = hs.a
+                    rhor = 1 + (1 - a**2)**0.5
+                    omega_h = a / (2 * rhor)
+                    
+                    # Find horizon index (closest to rhor)
+                    r_1d = r_2d[:,0] if r_2d.ndim > 1 else r_2d
+                    horizon_idx = np.abs(r_1d - rhor).argmin()
+                    
+                    # Get ΩF/ΩH profile at horizon
+                    if omega_f.ndim > 1:
+                        omega_f_horizon = omega_f[horizon_idx, :]
+                        theta_horizon = h_2d[horizon_idx, :] if h_2d.ndim > 1 else h_2d
+                        omega_ratio_horizon = omega_f_horizon / omega_h if omega_h != 0 else omega_f_horizon * 0
+                    else:
+                        omega_f_horizon = omega_f
+                        theta_horizon = np.pi/2  # equatorial
+                        omega_ratio_horizon = omega_f_horizon / omega_h if omega_h != 0 else 0
+                    
+                    results['omega_theta_profiles'].append({
+                        'time': current_time,
+                        'theta': theta_horizon,
+                        'omega_ratio': omega_ratio_horizon,
+                        'horizon_radius': rhor
+                    })
+                
+                results['times'].append(current_time)
+                
+            except Exception as e:
+                print(f"Error in 2D analysis for {dump_file}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        return results
+    
     def plot_1d_monopole_results(self, results, show=True):
         """Plot results from 1D monopole analysis - clean and focused"""
         
-        # Create figure with more space and larger subplots
+        # Create figure with better spacing
         fig = plt.figure(figsize=(16, 10))
         
-        # Use GridSpec with better spacing - more room between suptitle and subplots
+        # Use GridSpec with tighter spacing - reduced gaps between subplots
         from matplotlib.gridspec import GridSpec
-        gs = GridSpec(2, 3, figure=fig, hspace=0.55, wspace=0.4, 
-                     left=0.06, right=0.96, top=0.82, bottom=0.12)
+        gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.25, 
+                     left=0.06, right=0.96, top=0.88, bottom=0.10)
         
         # 1. Lorentz factor evolution
         ax1 = fig.add_subplot(gs[0, 0])
@@ -165,7 +259,7 @@ class MagnetizedAnalysis:
             ax1.plot(results['times'], results['lorentz_factors'], 'b-', linewidth=3)
             ax1.set_xlabel('Time', fontsize=13)
             ax1.set_ylabel('Lorentz Factor γ', fontsize=13)
-            ax1.set_title('Plasma Acceleration', fontsize=14, pad=20)
+            ax1.set_title('Plasma Acceleration', fontsize=14, pad=15)
             ax1.grid(True, alpha=0.3)
             ax1.tick_params(labelsize=12)
             
@@ -182,7 +276,7 @@ class MagnetizedAnalysis:
             ax2.axhline(y=0.5, color='k', linestyle='--', alpha=0.8, linewidth=2)
             ax2.set_xlabel('Time', fontsize=13)
             ax2.set_ylabel('ΩF/ΩH', fontsize=13)
-            ax2.set_title('Frame Dragging Efficiency', fontsize=14, pad=20)
+            ax2.set_title('Frame Dragging Efficiency', fontsize=14, pad=15)
             ax2.grid(True, alpha=0.3)
             ax2.tick_params(labelsize=12)
             
@@ -192,7 +286,7 @@ class MagnetizedAnalysis:
                     transform=ax2.transAxes, fontsize=13, fontweight='bold', va='top',
                     bbox=dict(boxstyle="round,pad=0.4", facecolor="lightcoral", alpha=0.9))
         
-        # 3. Key values comparison (with more space)
+        # 3. Key values comparison
         ax3 = fig.add_subplot(gs[0, 2])
         if results['sigma_initial'] and results['lorentz_factors']:
             categories = ['σ0', '√σ0', 'γ_final']
@@ -201,20 +295,19 @@ class MagnetizedAnalysis:
             
             bars = ax3.bar(categories, values, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
             ax3.set_ylabel('Value', fontsize=13)
-            ax3.set_title('Magnetization vs Acceleration', fontsize=14, pad=20)
+            ax3.set_title('Magnetization vs Acceleration', fontsize=14, pad=15)
             ax3.grid(True, alpha=0.3, axis='y')
             ax3.tick_params(labelsize=12)
             
-            # Value labels on bars with better positioning
+            # Value labels on bars
             for bar, value in zip(bars, values):
                 height = bar.get_height()
                 ax3.text(bar.get_x() + bar.get_width()/2., height + height*0.05,
                         f'{value:.1f}', ha='center', va='bottom', fontsize=13, fontweight='bold')
             
-            # Adjust y-axis to give more space for labels
             ax3.set_ylim(0, max(values) * 1.15)
         
-        # 4. Radial acceleration profiles with colorbar
+        # 4. Radial acceleration profiles with time progression colorbar (FIXED)
         ax4 = fig.add_subplot(gs[1, 0])
         if results['radial_profiles']['r'] is not None and results['radial_profiles']['gamma']:
             r = results['radial_profiles']['r']
@@ -224,8 +317,8 @@ class MagnetizedAnalysis:
             colormap = plt.cm.plasma
             norm = plt.Normalize(min(times), max(times))
             
-            # Show every 4th profile to avoid clutter
-            for i in range(0, len(results['radial_profiles']['gamma']), 4):
+            # Show every 5th profile to avoid clutter (FIXED: changed from 4 to 5)
+            for i in range(0, len(results['radial_profiles']['gamma']), 5):
                 gamma_prof = results['radial_profiles']['gamma'][i]
                 time = times[i]
                 color = colormap(norm(time))
@@ -233,18 +326,18 @@ class MagnetizedAnalysis:
             
             ax4.set_xlabel('Radius (r/rg)', fontsize=13)
             ax4.set_ylabel('Lorentz Factor γ', fontsize=13)
-            ax4.set_title('Radial Acceleration Profiles', fontsize=14, pad=20)
+            ax4.set_title('Radial Acceleration Evolution', fontsize=14, pad=15)
             ax4.grid(True, alpha=0.3)
             ax4.tick_params(labelsize=12)
             
-            # Add clean colorbar
+            # Add colorbar showing time progression (RESTORED)
             sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
             sm.set_array([])
             cbar = plt.colorbar(sm, ax=ax4, shrink=0.8, pad=0.02)
             cbar.set_label('Time', fontsize=12)
             cbar.ax.tick_params(labelsize=11)
         
-        # 5. Numerical results summary (spans two columns with more space)
+        # 5. Numerical results summary (MORE COMPACT)
         ax5 = fig.add_subplot(gs[1, 1:])  # Span two columns
         ax5.axis('off')
         
@@ -256,7 +349,7 @@ class MagnetizedAnalysis:
             efficiency = gamma_final / sqrt_sigma0
             final_velocity = np.sqrt(1 - 1/gamma_final**2)
             
-            # Create clean results table
+            # More compact results text
             results_text = f"""
 KEY SIMULATION RESULTS
 
@@ -272,13 +365,14 @@ Theoretical Prediction:       ΩF/ΩH = 0.500
 Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
             """
             
-            ax5.text(0.15, 0.98, results_text, transform=ax5.transAxes, 
-                    fontsize=13, verticalalignment='top', fontfamily='monospace',
-                    bbox=dict(boxstyle="round,pad=0.6", facecolor="lightgray", alpha=0.9, edgecolor='black'))
+            # Smaller text box with tighter padding
+            ax5.text(0.15, 0.95, results_text, transform=ax5.transAxes, 
+                    fontsize=12, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle="round,pad=0.4", facecolor="lightgray", alpha=0.9, edgecolor='black'))
         
-        # Add clean main title with optimal spacing
+        # Removed erroneous "(t=200)" from title
         fig.suptitle('1D Monopole Magnetosphere Analysis', 
-                    fontsize=18, fontweight='bold', y=0.90)
+                    fontsize=18, fontweight='bold', y=0.92)
         
         # Save figure
         filename = os.path.join(self.output_dir, "monopole_1d_results.png")
@@ -292,6 +386,460 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
             plt.show()
         else:
             plt.close()
+    
+    def plot_2d_monopole_results(self, results, show=True):
+        """Plot 2D BZ monopole analysis results - clean version"""
+        if not results['times']:
+            print("No results to plot!")
+            return
+            
+        print(f"Plotting results from {len(results['times'])} time steps")
+        
+        fig = plt.figure(figsize=(16, 12))
+        from matplotlib.gridspec import GridSpec
+        gs = GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
+        
+        # 1. Power extraction evolution - show time evolution with colorbar
+        ax1 = fig.add_subplot(gs[0, 0])
+        if results['power_extraction']:
+            # Show multiple timesteps with color progression
+            times = [data['time'] for data in results['power_extraction']]
+            colormap = plt.cm.viridis
+            norm = plt.Normalize(min(times), max(times))
+            
+            # Sample every 5th timestep to avoid clutter
+            sample_indices = range(0, len(results['power_extraction']), 5)
+            
+            for i in sample_indices:
+                power_data = results['power_extraction'][i]
+                r_coord = power_data['r_coord']
+                energy_flux = power_data['energy_flux']
+                time = power_data['time']
+                color = colormap(norm(time))
+                
+                ax1.loglog(r_coord, np.abs(energy_flux), color=color, alpha=0.7, linewidth=2)
+            
+            ax1.set_xlabel('Radius (r/rg)', fontsize=12)
+            ax1.set_ylabel('|Energy Flux|', fontsize=12)
+            ax1.set_title('Power Extraction Evolution', fontsize=13)  # FIXED: Removed (t=200)
+            ax1.grid(True, alpha=0.3)
+            
+            # Add colorbar for time progression
+            sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
+            sm.set_array([])
+            cbar1 = plt.colorbar(sm, ax=ax1, shrink=0.8, pad=0.02)
+            cbar1.set_label('Time', fontsize=11)
+            cbar1.ax.tick_params(labelsize=10)
+        
+        # 2. Full domain fast surface visualization with better density display
+        ax2 = fig.add_subplot(gs[0, 1])
+        if results['fast_surface_data']:
+            latest_data = results['fast_surface_data'][-1]
+            r_2d = latest_data['r']
+            h_2d = latest_data['h']
+            ur_2d = latest_data['ur']
+            rho_2d = latest_data['rho']
+            
+            # Convert to Cartesian - FIXED: Full circle display
+            x = r_2d * np.sin(h_2d)
+            z = r_2d * np.cos(h_2d)
+            
+            # Create mirrored data for full circle visualization
+            x_mirror = -x
+            z_mirror = z
+            rho_mirror = rho_2d
+            ur_mirror = ur_2d
+            
+            # Combine original and mirrored
+            x_full = np.concatenate([x, x_mirror], axis=1)
+            z_full = np.concatenate([z, z_mirror], axis=1)
+            rho_full = np.concatenate([rho_2d, rho_mirror], axis=1)
+            ur_full = np.concatenate([ur_2d, ur_mirror], axis=1)
+            
+            # Better density normalization for visibility
+            rho_positive = rho_full[rho_full > 0]
+            if len(rho_positive) > 0:
+                vmin = np.percentile(rho_positive, 1)  # 1st percentile
+                vmax = np.percentile(rho_positive, 99)  # 99th percentile
+            else:
+                vmin, vmax = rho_full.min(), rho_full.max()
+            
+            # Plot density with better contrast
+            im = ax2.pcolormesh(x_full, z_full, rho_full, cmap='viridis', 
+                               norm=LogNorm(vmin=vmin, vmax=vmax), alpha=0.8)
+            
+            # Overplot fast surface contour
+            try:
+                ax2.contour(x_full, z_full, ur_full, levels=[0], 
+                           colors='red', linewidths=2, alpha=0.9)
+            except:
+                print("Could not plot fast surface contour")
+            
+            # Add black hole
+            if results['omega_theta_profiles']:
+                rh = results['omega_theta_profiles'][-1]['horizon_radius']
+                circle = plt.Circle((0, 0), rh, color='black', alpha=1.0, zorder=10)
+                ax2.add_patch(circle)
+            
+            ax2.set_xlabel('X (r_g)', fontsize=12)
+            ax2.set_ylabel('Z (r_g)', fontsize=12)
+            ax2.set_title('Fast Surface (u^r=0)', fontsize=13)
+            ax2.set_xlim(-50, 50)
+            ax2.set_ylim(-50, 50)
+            ax2.set_aspect('equal')
+            
+            # Add colorbar
+            cbar2 = plt.colorbar(im, ax=ax2, label='log10(density)', shrink=0.8)
+        
+        # 3. ΩF/ΩH vs θ profile - final timestep only (clean)
+        ax3 = fig.add_subplot(gs[1, 0])
+        if results['omega_theta_profiles']:
+            latest_omega = results['omega_theta_profiles'][-1]  # Final timestep only
+            theta = latest_omega['theta']
+            omega_ratio = latest_omega['omega_ratio']
+            final_time = latest_omega['time']
+            
+            if hasattr(theta, '__len__') and len(theta) > 1:
+                ax3.plot(theta, omega_ratio, 'b-', linewidth=3)
+                ax3.axhline(y=0.5, color='r', linestyle='--', alpha=0.8, linewidth=2)
+                ax3.fill_between(theta, 0.5, omega_ratio, alpha=0.2, color='lightblue')
+                ax3.set_xlabel('θ (radians)', fontsize=12)
+                ax3.set_ylabel('ΩF/ΩH', fontsize=12)
+                ax3.set_title(f'Frame Dragging at Horizon (t={final_time:.0f})', fontsize=13)
+                ax3.grid(True, alpha=0.3)
+                ax3.set_xlim(0, np.pi)
+                ax3.set_ylim(0.4, 0.8)
+                
+                # Add theta labels
+                ax3.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
+                ax3.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
+            else:
+                ax3.text(0.5, 0.5, f'ΩF/ΩH = {omega_ratio:.3f}', 
+                        transform=ax3.transAxes, ha='center', va='center', fontsize=14,
+                        bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
+                ax3.set_title('Frame Dragging Ratio', fontsize=13)
+        
+        # 4. Clean numerical summary 
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.axis('off')
+        
+        if results['omega_theta_profiles']:
+            latest_omega = results['omega_theta_profiles'][-1]
+            omega_ratio = latest_omega['omega_ratio']
+            
+            if hasattr(omega_ratio, '__len__'):
+                avg_omega = np.mean(omega_ratio)
+                min_omega = np.min(omega_ratio)
+                max_omega = np.max(omega_ratio)
+                asymmetry = (max_omega - min_omega) / avg_omega * 100
+                
+                summary_text = f"""
+2D BZ MONOPOLE RESULTS
+
+Frame Dragging Analysis:
+Average ΩF/ΩH = {avg_omega:.3f}
+Min ΩF/ΩH = {min_omega:.3f}  
+Max ΩF/ΩH = {max_omega:.3f}
+BZ Theory = 0.500
+Deviation = {abs(avg_omega-0.5)/0.5*100:.1f}%
+Angular variation = {asymmetry:.1f}%
+
+Black Hole Properties:
+Horizon radius = {latest_omega['horizon_radius']:.2f} rg
+Estimated spin a ≈ 0.9
+                """
+            else:
+                summary_text = f"""
+2D BZ MONOPOLE RESULTS
+
+Frame Dragging:
+ΩF/ΩH = {omega_ratio:.3f}
+BZ Theory = 0.500
+Deviation = {abs(omega_ratio-0.5)/0.5*100:.1f}%
+
+Black Hole Properties:
+Horizon radius = {latest_omega['horizon_radius']:.2f} rg
+
+Analysis Summary:
+Time span: {results['times'][0]:.1f} - {results['times'][-1]:.1f}
+Snapshots: {len(results['times'])}
+                """
+            
+            ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, 
+                    fontsize=11, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.9))
+        
+        fig.suptitle('2D BZ Monopole Magnetosphere Analysis', fontsize=18, fontweight='bold')
+        
+        # Save figure
+        filename = os.path.join(self.output_dir, "bz_monopole_2d_results.png")
+        plt.savefig(filename, dpi=200, bbox_inches='tight', facecolor='white')
+        print(f"Saved enhanced 2D analysis plot: {filename}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
+    
+    def create_2d_density_animation(self, dump_files, output_file="bz_monopole_2d_density.mp4", fps=3):
+        """Create enhanced 2D density evolution animation - FIXED for full circle display"""
+        print(f"Creating enhanced 2D density animation with {len(dump_files)} frames...")
+        
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Sample more densely at the beginning, then every 3rd file
+        early_files = dump_files[:30]  # First 30 files (early evolution)
+        later_files = dump_files[30::4]  # Every 4th file after that
+        sampled_files = early_files + later_files
+        print(f"Using {len(sampled_files)} frames for animation (dense early sampling)")
+        
+        # Find global density range with better percentile approach
+        global_rho_min, global_rho_max = float('inf'), float('-inf')
+        all_positive_rho = []
+        
+        print("Computing global density range...")
+        for dump_file in sampled_files[::5]:  # Sample for range calculation
+            try:
+                self.load_data("gdump", dump_file)
+                rho = hs.rho.squeeze()
+                positive_rho = rho[rho > 0]
+                if len(positive_rho) > 0:
+                    all_positive_rho.extend(positive_rho.flatten())
+            except:
+                continue
+        
+        if all_positive_rho:
+            # Use percentiles for better contrast
+            global_rho_min = np.percentile(all_positive_rho, 1)
+            global_rho_max = np.percentile(all_positive_rho, 99)
+        else:
+            global_rho_min, global_rho_max = 1e-10, 1e-5
+        
+        print(f"Density range (1-99 percentile): {global_rho_min:.2e} to {global_rho_max:.2e}")
+        
+        def update(frame):
+            ax.clear()
+            dump_file = sampled_files[frame]
+            self.load_data("gdump", dump_file)
+            
+            rho = hs.rho.squeeze()
+            r = hs.r.squeeze()
+            h = hs.h.squeeze()
+            
+            # Get radial velocity for fast surface
+            ur = hs.uu[1].squeeze() if hasattr(hs, 'uu') else None
+            
+            # Convert to Cartesian
+            x = r * np.sin(h)
+            z = r * np.cos(h)
+            
+            # Create full circle by mirroring across x=0 axis (FIXED)
+            x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+            z_full = np.concatenate([z[:, ::-1], z], axis=1)
+            rho_full = np.concatenate([rho[:, ::-1], rho], axis=1)
+            
+            # Use pcolormesh with better normalization
+            im = ax.pcolormesh(x_full, z_full, rho_full, cmap='plasma',
+                              norm=LogNorm(vmin=global_rho_min, vmax=global_rho_max),
+                              shading='auto', alpha=0.9)
+            
+            # Add fast surface if available
+            if ur is not None:
+                try:
+                    ur_full = np.concatenate([ur[:, ::-1], ur], axis=1)
+                    ax.contour(x_full, z_full, ur_full, levels=[0], 
+                              colors='red', linewidths=2, alpha=0.9)
+                except:
+                    pass  # Skip if contour fails
+            
+            # Add black hole
+            rhor = 1.35  # For a≈0.9
+            circle = plt.Circle((0, 0), rhor, facecolor='black', edgecolor='white', 
+                              linewidth=2, alpha=1.0, zorder=10)
+            ax.add_patch(circle)
+            
+            ax.set_xlabel('X (r_g)', fontsize=14)
+            ax.set_ylabel('Z (r_g)', fontsize=14)
+            ax.set_title(f'2D BZ Monopole: Density + Fast Surface (t = {hs.t:.1f})', fontsize=16)
+            ax.set_xlim(-50, 50)
+            ax.set_ylim(-50, 50)
+            ax.set_aspect('equal')
+            
+            return im,
+        
+        # Create colorbar using first frame
+        self.load_data("gdump", sampled_files[0])
+        rho = hs.rho.squeeze()
+        r = hs.r.squeeze()
+        h = hs.h.squeeze()
+        
+        x = r * np.sin(h)
+        z = r * np.cos(h)
+        x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+        z_full = np.concatenate([z[:, ::-1], z], axis=1)
+        rho_full = np.concatenate([rho[:, ::-1], rho], axis=1)
+        
+        im = ax.pcolormesh(x_full, z_full, rho_full, cmap='plasma',
+                          norm=LogNorm(vmin=global_rho_min, vmax=global_rho_max),
+                          shading='auto', alpha=0.9)
+        cbar = fig.colorbar(im, ax=ax, label='Density (log scale)')
+        
+        ani = animation.FuncAnimation(fig, update, frames=len(sampled_files),
+                                     blit=False, interval=300, repeat=True)  # Slower for better viewing
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        try:
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"Saved enhanced 2D density animation: {output_path}")
+            print(f"Animation duration: {len(sampled_files)/fps:.1f} seconds")
+        except Exception as e:
+            print(f"Error saving animation: {e}")
+            print("Make sure ffmpeg is installed")
+        
+        plt.close(fig)
+    
+    def create_frame_dragging_animation(self, results, output_file="bz_monopole_frame_dragging.mp4", fps=6):
+        """Create longer animation showing ΩF/ΩH(θ) evolution over time"""
+        if not results['omega_theta_profiles'] or len(results['omega_theta_profiles']) < 10:
+            print("Insufficient data for frame dragging animation")
+            return
+            
+        print(f"Creating frame dragging animation with {len(results['omega_theta_profiles'])} time steps...")
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Use more time steps for longer animation
+        sample_indices = np.linspace(0, len(results['omega_theta_profiles'])-1, 
+                                   min(80, len(results['omega_theta_profiles']))).astype(int)
+        
+        def update(frame):
+            ax.clear()
+            
+            omega_data = results['omega_theta_profiles'][sample_indices[frame]]
+            theta = omega_data['theta']
+            omega_ratio = omega_data['omega_ratio']
+            time = omega_data['time']
+            
+            if hasattr(theta, '__len__') and len(theta) > 1:
+                # Plot current profile
+                ax.plot(theta, omega_ratio, 'b-', linewidth=4, alpha=0.9)
+                
+                # Add theory reference
+                ax.axhline(y=0.5, color='r', linestyle='--', alpha=0.8, linewidth=2, 
+                          label='BZ Theory = 0.5')
+                
+                # Fill area
+                ax.fill_between(theta, 0.5, omega_ratio, alpha=0.3, color='lightblue')
+                
+                # Styling
+                ax.set_xlabel('θ (radians)', fontsize=14)
+                ax.set_ylabel('ΩF/ΩH', fontsize=14)
+                ax.set_title(f'Frame Dragging Evolution at Horizon (t = {time:.1f})', fontsize=16)
+                ax.grid(True, alpha=0.3)
+                ax.set_xlim(0, np.pi)
+                ax.set_ylim(0.4, 0.8)
+                
+                # Add theta labels
+                ax.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
+                ax.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
+                
+                # Add statistics
+                avg_omega = np.mean(omega_ratio)
+                min_omega = np.min(omega_ratio)
+                max_omega = np.max(omega_ratio)
+                
+                stats_text = f'Avg: {avg_omega:.3f}\nRange: {min_omega:.3f} - {max_omega:.3f}'
+                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                       fontsize=12, verticalalignment='top',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+        
+        ani = animation.FuncAnimation(fig, update, frames=len(sample_indices),
+                                     blit=False, interval=200, repeat=True)  # Slightly slower
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        try:
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"Saved frame dragging animation: {output_path}")
+            print(f"Animation duration: {len(sample_indices)/fps:.1f} seconds")
+        except Exception as e:
+            print(f"Error saving frame dragging animation: {e}")
+        
+        plt.close(fig)
+    
+    def create_power_extraction_animation(self, results, output_file="bz_monopole_power_extraction.mp4", fps=6):
+        """Create animation showing power extraction evolution over time - FIXED"""
+        if not results['power_extraction'] or len(results['power_extraction']) < 10:
+            print("Insufficient data for power extraction animation")
+            return
+            
+        print(f"Creating power extraction animation with {len(results['power_extraction'])} time steps...")
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Sample time steps for animation
+        sample_indices = np.linspace(0, len(results['power_extraction'])-1, 
+                                   min(60, len(results['power_extraction']))).astype(int)
+        
+        def update(frame):
+            ax.clear()
+            
+            power_data = results['power_extraction'][sample_indices[frame]]
+            r_coord = power_data['r_coord']
+            energy_flux = power_data['energy_flux']
+            time = power_data['time']
+            
+            # Ensure we have single arrays (not 2D)
+            if energy_flux.ndim > 1:
+                energy_flux = energy_flux.mean(axis=0)  # Average if still 2D
+            if r_coord.ndim > 1:
+                r_coord = r_coord[:, 0]  # Take first column if 2D
+            
+            # Plot current power profile
+            ax.loglog(r_coord, np.abs(energy_flux), 'b-', linewidth=3, alpha=0.9)
+            
+            # Styling
+            ax.set_xlabel('Radius (r/rg)', fontsize=14)
+            ax.set_ylabel('|Energy Flux|', fontsize=14)
+            ax.set_title(f'Power Extraction Evolution (t = {time:.1f})', fontsize=16)
+            ax.grid(True, alpha=0.3)
+            
+            # Add statistics in corner - FIXED numpy format error completely
+            try:
+                # Ensure all values are 1D numpy arrays
+                energy_flux_1d = np.asarray(energy_flux).flatten()
+                r_coord_1d = np.asarray(r_coord).flatten()
+                
+                total_power = np.trapezoid(np.abs(energy_flux_1d), r_coord_1d)
+                max_power = np.max(np.abs(energy_flux_1d))
+                
+                # Convert to regular Python numbers to avoid any numpy formatting issues
+                total_power_val = float(total_power) if np.isscalar(total_power) else float(total_power.item())
+                max_power_val = float(max_power) if np.isscalar(max_power) else float(max_power.item())
+                
+                stats_text = f'Total Power: {total_power_val:.2e}\nPeak Flux: {max_power_val:.2e}'
+                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                       fontsize=12, verticalalignment='top',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+            except Exception as e:
+                print(f"Debug info - energy_flux shape: {np.asarray(energy_flux).shape}, type: {type(energy_flux)}")
+                print(f"Debug info - r_coord shape: {np.asarray(r_coord).shape}, type: {type(r_coord)}")
+                # Fallback without statistics
+                ax.text(0.02, 0.98, f'Time: {float(time):.1f}', transform=ax.transAxes, 
+                       fontsize=12, verticalalignment='top',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+        
+        ani = animation.FuncAnimation(fig, update, frames=len(sample_indices),
+                                     blit=False, interval=200, repeat=True)
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        try:
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"Saved power extraction animation: {output_path}")
+            print(f"Animation duration: {len(sample_indices)/fps:.1f} seconds")
+        except Exception as e:
+            print(f"Error saving power extraction animation: {e}")
+        
+        plt.close(fig)
     
     def plot_lorentz_factor_detailed(self, results, show=True):
         """Create detailed plot focusing on Lorentz factor evolution"""
@@ -385,6 +933,8 @@ def main():
                        help="Output directory for plots and movies")
     parser.add_argument("--sample", type=int, default=1, 
                        help="Sample every N dump files")
+    parser.add_argument("--animate", action="store_true", 
+                       help="Create density evolution animation (2D only)")
     args = parser.parse_args()
     
     # Initialize analyzer
@@ -413,6 +963,34 @@ def main():
         if results['omega_ratios']:
             avg_omega = np.mean(results['omega_ratios'])
             print(f"Average ΩF/ΩH: {avg_omega:.3f} (theory: 0.5)")
+    
+    elif args.problem in ["monopole_2d", "bz_monopole"]:
+        # Analyze 2D monopole problems
+        results = analyzer.analyze_2d_monopole(dump_files, sample_every=args.sample)
+        analyzer.plot_2d_monopole_results(results)
+        
+        # Create animation if requested
+        if args.animate:
+            analyzer.create_2d_density_animation(dump_files)
+            analyzer.create_frame_dragging_animation(results)
+            analyzer.create_power_extraction_animation(results)
+        
+        print("\n=== 2D KEY RESULTS ===")
+        if results['omega_theta_profiles']:
+            latest_omega = results['omega_theta_profiles'][-1]
+            omega_ratio = latest_omega['omega_ratio']
+            if hasattr(omega_ratio, '__len__'):
+                avg_omega = np.mean(omega_ratio)
+                print(f"Average ΩF/ΩH: {avg_omega:.3f} (theory: 0.5)")
+                print(f"ΩF/ΩH range: {np.min(omega_ratio):.3f} to {np.max(omega_ratio):.3f}")
+            else:
+                print(f"ΩF/ΩH: {omega_ratio:.3f} (theory: 0.5)")
+        
+        if results['fast_surface_data']:
+            print(f"Fast surface analysis completed for {len(results['fast_surface_data'])} time steps")
+        
+        if results['power_extraction']:
+            print(f"Power extraction analysis completed for {len(results['power_extraction'])} time steps")
 
 
 if __name__ == "__main__":

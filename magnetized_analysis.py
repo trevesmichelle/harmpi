@@ -13,6 +13,7 @@ import os
 import argparse
 from matplotlib.colors import LogNorm
 from matplotlib.patches import Ellipse
+from matplotlib.gridspec import GridSpec
 import glob
 
 
@@ -34,6 +35,52 @@ class MagnetizedAnalysis:
         hs.rd(dump_file)
         print(f"Loaded data from {dump_file}, time: {hs.t:.6f}")
     
+    def detect_field_type(self, dump_file):
+        """
+        Automatically detect field type (monopole vs dipole) from simulation data
+        """
+        try:
+            self.load_data("gdump", dump_file)
+            
+            if not hasattr(hs, 'B'):
+                return "Unknown"
+            
+            B_r = hs.B[1].squeeze()
+            B_theta = hs.B[2].squeeze()
+            
+            if B_r.ndim < 2:
+                return "1D"
+            
+            # Check field reversal across equator (dipole signature)
+            n_theta = B_r.shape[1]
+            north_quarter = n_theta // 4
+            south_quarter = 3 * n_theta // 4
+            
+            # Average field in northern and southern hemispheres
+            B_r_north = B_r[:10, :north_quarter].mean()
+            B_r_south = B_r[:10, south_quarter:].mean()
+            
+            # Check for field reversal (dipole signature)
+            field_reversal = (B_r_north * B_r_south < 0)
+            
+            # Check pole/equator ratio
+            equator_idx = n_theta // 2
+            pole_field = np.sqrt(B_r[:10, 0]**2 + B_theta[:10, 0]**2).mean()
+            equator_field = np.sqrt(B_r[:10, equator_idx]**2 + B_theta[:10, equator_idx]**2).mean()
+            topology_ratio = pole_field / equator_field if equator_field > 0 else 1
+            
+            # Classification logic
+            if field_reversal and topology_ratio < 2.0:
+                return "Dipole"
+            elif not field_reversal and topology_ratio > 1.5:
+                return "Monopole"
+            else:
+                return "Mixed/Evolving"
+                
+        except Exception as e:
+            print(f"Could not detect field type: {e}")
+            return "Unknown"
+
     def calculate_magnetization(self):
         """Calculate magnetization parameter sigma = b^2/(4π*rho*c^2) = bsq/rho"""
         if not hasattr(hs, 'bsq') or not hasattr(hs, 'rho'):
@@ -472,7 +519,7 @@ class MagnetizedAnalysis:
         fig = plt.figure(figsize=(16, 10))
         
         # Use GridSpec with tighter spacing - reduced gaps between subplots
-        from matplotlib.gridspec import GridSpec
+        # from matplotlib.gridspec import GridSpec
         gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.25, 
                      left=0.06, right=0.96, top=0.88, bottom=0.10)
         
@@ -610,13 +657,20 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
         else:
             plt.close()
     
-    def plot_2d_monopole_results(self, results, show=True):
-        """Plot 2D BZ monopole analysis results - clean version"""
+    def plot_2d_monopole_results(self, results, field_type="Auto", show=True):
+        """Plot 2D BZ analysis results with dynamic labeling"""
         if not results['times']:
             print("No results to plot!")
             return
             
+        # Auto-detect field type if not specified
+        if field_type == "Auto":
+            dump_files = get_dump_files()
+            if dump_files:
+                field_type = self.detect_field_type(dump_files[-1])
+        
         print(f"Plotting results from {len(results['times'])} time steps")
+        print(f"Detected field type: {field_type}")
         
         fig = plt.figure(figsize=(16, 12))
         from matplotlib.gridspec import GridSpec
@@ -791,13 +845,23 @@ Snapshots: {len(results['times'])}
             ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, 
                     fontsize=11, verticalalignment='top', fontfamily='monospace',
                     bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.9))
+            
+        # Dynamic main title
+        title_map = {
+            "Monopole": "2D BZ Monopole Magnetosphere Analysis",
+            "Dipole": "2D BZ Dipole Magnetosphere Analysis",
+            "Mixed/Evolving": "2D BZ Evolving Magnetosphere Analysis", 
+            "Unknown": "2D BZ Magnetosphere Analysis"
+        }
         
-        fig.suptitle('2D BZ Monopole Magnetosphere Analysis', fontsize=18, fontweight='bold')
+        main_title = title_map.get(field_type, f"2D BZ {field_type} Magnetosphere Analysis")
+        fig.suptitle(main_title, fontsize=18, fontweight='bold')
         
-        # Save figure
-        filename = os.path.join(self.output_dir, "bz_monopole_2d_results.png")
-        plt.savefig(filename, dpi=200, bbox_inches='tight', facecolor='white')
-        print(f"Saved enhanced 2D analysis plot: {filename}")
+        # Dynamic filename
+        safe_field_type = field_type.lower().replace('/', '_').replace(' ', '_')
+        filename = os.path.join(self.output_dir, f"bz_magnetosphere_{safe_field_type}_results.png")
+        plt.savefig(filename, dpi=200, bbox_inches='tight')
+        print(f"Saved {field_type} magnetosphere analysis: {filename}")
         
         if show:
             plt.show()
@@ -1064,6 +1128,192 @@ Snapshots: {len(results['times'])}
         
         plt.close(fig)
     
+    def analyze_magnetic_hair_loss(self, dump_files, sample_every=5):
+        """
+        Question 1: How do black holes lose their hair?
+        
+        Analyze magnetic field evolution to understand the no-hair theorem in practice.
+        "Hair" = any complex field structure beyond mass, charge, spin.
+        """
+        print("\n=== ANALYZING BLACK HOLE 'HAIR LOSS' ===")
+        print("No-Hair Theorem: Classical BHs characterized only by M, Q, J")
+        print("But rotating BHs can sustain magnetic structure via frame dragging!")
+        
+        results = {
+            'times': [],
+            'field_strength_horizon': [],
+            'field_topology_ratio': [],
+            'frame_dragging_efficiency': [],
+            'magnetic_flux_conservation': []
+        }
+        
+        for dump_file in dump_files[::sample_every]:
+            try:
+                self.load_data("gdump", dump_file)
+                current_time = float(hs.t)
+                
+                # Get 2D magnetic field components
+                if not hasattr(hs, 'B'):
+                    print(f"No magnetic field data in {dump_file}")
+                    continue
+                    
+                B_r = hs.B[1].squeeze()
+                B_theta = hs.B[2].squeeze()
+                r_2d = hs.r.squeeze()
+                theta_2d = hs.h.squeeze()
+                
+                # Field strength near horizon (first few radial zones)
+                horizon_field_strength = np.sqrt(B_r[:5, :]**2 + B_theta[:5, :]**2).mean()
+                
+                # Field topology analysis: monopole vs dipole character
+                # Compare field at pole (θ=0) vs equator (θ=π/2)
+                n_theta = B_r.shape[1]
+                pole_idx = 0  # θ ≈ 0
+                equator_idx = n_theta // 2  # θ ≈ π/2
+                
+                pole_field = np.sqrt(B_r[:10, pole_idx]**2 + B_theta[:10, pole_idx]**2).mean()
+                equator_field = np.sqrt(B_r[:10, equator_idx]**2 + B_theta[:10, equator_idx]**2).mean()
+                
+                # Ratio > 1: monopole-like, < 1: more dipole-like
+                topology_ratio = pole_field / equator_field if equator_field > 0 else 1
+                
+                # Frame dragging analysis
+                hs.aux()  # Compute auxiliary quantities
+                if hasattr(hs, 'omegaf2'):
+                    omega_f = hs.omegaf2.squeeze()
+                    a = hs.a
+                    rhor = 1 + (1 - a**2)**0.5
+                    omega_h = a / (2 * rhor)
+                    
+                    # Average frame dragging efficiency
+                    if omega_f.ndim > 1:
+                        frame_drag_eff = np.mean(omega_f / omega_h) if omega_h != 0 else 0
+                    else:
+                        frame_drag_eff = omega_f / omega_h if omega_h != 0 else 0
+                else:
+                    frame_drag_eff = 0
+                
+                # Magnetic flux conservation (through equatorial plane)
+                if r_2d.ndim > 1:
+                    flux_equatorial = (B_r[:, equator_idx] * r_2d[:, equator_idx]**2).sum()
+                else:
+                    flux_equatorial = (B_r * r_2d**2).sum()
+                
+                # Store results
+                results['detected_field_type'] = self.detect_field_type(dump_files[-1])
+                results['times'].append(current_time)
+                results['field_strength_horizon'].append(horizon_field_strength)
+                results['field_topology_ratio'].append(topology_ratio)
+                results['frame_dragging_efficiency'].append(frame_drag_eff)
+                results['magnetic_flux_conservation'].append(flux_equatorial)
+                
+                print(f"t={current_time:.1f}: B_horizon={horizon_field_strength:.2e}, "
+                      f"topology={topology_ratio:.2f}, ΩF/ΩH={frame_drag_eff:.3f}")
+                
+            except Exception as e:
+                print(f"Error analyzing {dump_file}: {e}")
+                continue
+        
+        return results
+
+    def plot_hair_loss_analysis(self, results, field_type="Auto", show=True):
+        """Plot the magnetic hair loss analysis results with automatic labeling"""
+        if not results['times']:
+            return
+        
+        # Auto-detect field type if not specified
+        if field_type == "Auto" and results['times']:
+            # Use the last dump file for detection (final evolved state)
+            dump_files = get_dump_files()
+            if dump_files:
+                field_type = self.detect_field_type(dump_files[-1])
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Dynamic title based on detected field type
+        title_map = {
+            "Monopole": "Black Hole \"Hair Loss\" Analysis - 2D Monopole",
+            "Dipole": "Black Hole \"Hair Loss\" Analysis - 2D Dipole", 
+            "Mixed/Evolving": "Black Hole \"Hair Loss\" Analysis - Evolving Field",
+            "1D": "Black Hole \"Hair Loss\" Analysis - 1D Field",
+            "Unknown": "Black Hole \"Hair Loss\" Analysis - Magnetized BH"
+        }
+        
+        title = title_map.get(field_type, f"Black Hole \"Hair Loss\" Analysis - {field_type} Field")
+        fig.suptitle(title, fontsize=16, fontweight='bold')
+        
+        # Rest of your plotting code remains the same...
+        times = results['times']
+        
+        # 1. Field strength evolution
+        ax1 = axes[0, 0]
+        ax1.semilogy(times, results['field_strength_horizon'], 'b-', linewidth=2)
+        ax1.set_xlabel('Time (M)', fontsize=12)
+        ax1.set_ylabel('B-field Strength (horizon)', fontsize=12)
+        ax1.set_title('Magnetic Field Persistence', fontsize=13)
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Field topology evolution with dynamic interpretation
+        ax2 = axes[0, 1] 
+        ax2.plot(times, results['field_topology_ratio'], 'r-', linewidth=2)
+        ax2.axhline(y=1, color='k', linestyle='--', alpha=0.5, label='Monopole-Dipole Transition')
+        ax2.set_xlabel('Time (M)', fontsize=12)
+        ax2.set_ylabel('Pole/Equator Field Ratio', fontsize=12)
+        
+        # Dynamic subplot title based on field type
+        if field_type == "Dipole":
+            ax2.set_title('Field Evolution (Dipole→Monopole?)', fontsize=13)
+        else:
+            ax2.set_title('Field Topology Evolution', fontsize=13)
+        
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # 3. Frame dragging efficiency  
+        ax3 = axes[1, 0]
+        ax3.plot(times, results['frame_dragging_efficiency'], 'g-', linewidth=2)
+        ax3.axhline(y=0.5, color='r', linestyle='--', alpha=0.7, label='BZ Theory = 0.5')
+        ax3.set_xlabel('Time (M)', fontsize=12)
+        ax3.set_ylabel('ΩF/ΩH', fontsize=12)
+        ax3.set_title('Frame Dragging Efficiency', fontsize=13)
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        
+        # 4. Flux conservation with dynamic interpretation
+        ax4 = axes[1, 1]
+        flux_normalized = np.array(results['magnetic_flux_conservation'])
+        if len(flux_normalized) > 0:
+            flux_normalized = flux_normalized / flux_normalized[0]
+        ax4.plot(times, flux_normalized, 'm-', linewidth=2)
+        ax4.axhline(y=1, color='k', linestyle='--', alpha=0.5, label='Perfect Conservation')
+        ax4.set_xlabel('Time (M)', fontsize=12)
+        ax4.set_ylabel('Φ/Φ₀ (normalized)', fontsize=12)
+        
+        # Dynamic title based on flux behavior
+        max_flux_ratio = max(flux_normalized) if len(flux_normalized) > 0 else 1
+        if max_flux_ratio > 5:
+            ax4.set_title('Magnetic Flux Amplification (!)', fontsize=13, color='red')
+        elif max_flux_ratio < 0.5:
+            ax4.set_title('Magnetic Flux Dissipation', fontsize=13) 
+        else:
+            ax4.set_title('Magnetic Flux Conservation', fontsize=13)
+            
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+        
+        plt.tight_layout()
+        
+        # Dynamic filename
+        safe_field_type = field_type.lower().replace('/', '_').replace(' ', '_')
+        filename = os.path.join(self.output_dir, f"magnetic_hair_loss_{safe_field_type}.png")
+        plt.savefig(filename, dpi=200, bbox_inches='tight')
+        print(f"Saved hair loss analysis: {filename}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
     def plot_lorentz_factor_detailed(self, results, show=True):
         """Create detailed plot focusing on Lorentz factor evolution"""
         
@@ -1158,6 +1408,8 @@ def main():
                        help="Sample every N dump files")
     parser.add_argument("--animate", action="store_true", 
                        help="Create density evolution animation (2D only)")
+    parser.add_argument("--soma2017", action="store_true", 
+                   help="Run SOMA2017 hair loss analysis only")
     args = parser.parse_args()
     
     # Initialize analyzer
@@ -1172,6 +1424,26 @@ def main():
     print(f"Found {len(dump_files)} dump files")
     print(f"Analyzing {args.problem} problem...")
     
+    if args.soma2017:
+        print("SOMA2017: Analyzing black hole 'hair loss'...")
+        hair_results = analyzer.analyze_magnetic_hair_loss(dump_files, sample_every=5)
+        
+        # Use detected field type for labeling
+        detected_type = hair_results.get('detected_field_type', 'Unknown')
+        print(f"Detected field type: {detected_type}")
+        analyzer.plot_hair_loss_analysis(hair_results, field_type=detected_type)
+        
+        # Quick summary with NaN handling
+        if hair_results['frame_dragging_efficiency']:
+            valid_omega = [x for x in hair_results['frame_dragging_efficiency'] if not np.isnan(x)]
+            if valid_omega:
+                avg_omega = np.mean(valid_omega)
+                print(f"Average ΩF/ΩH = {avg_omega:.3f} (theory = 0.500)")
+            else:
+                print("ΩF/ΩH data contains only NaN values")
+        print(f"Results saved to: {args.output}")
+        return  # Skip other analyses
+
     if args.problem == "monopole_1d":
         # Analyze 1D monopole problem
         results = analyzer.analyze_1d_monopole(dump_files, sample_every=args.sample)
@@ -1188,9 +1460,15 @@ def main():
             print(f"Average ΩF/ΩH: {avg_omega:.3f} (theory: 0.5)")
     
     elif args.problem in ["monopole_2d", "bz_monopole"]:
+        # DETECT FIELD TYPE FOR FULL ANALYSIS TOO
+        detected_type = analyzer.detect_field_type(dump_files[-1])
+        print(f"Detected field type: {detected_type}")
+        
         # Analyze 2D monopole problems
         results = analyzer.analyze_2d_monopole(dump_files, sample_every=args.sample)
-        analyzer.plot_2d_monopole_results(results)
+        
+        # PASS FIELD TYPE TO PLOTTING FUNCTION
+        analyzer.plot_2d_monopole_results(results, field_type=detected_type)
         
         # Create animation if requested
         if args.animate:
@@ -1198,7 +1476,7 @@ def main():
             analyzer.create_frame_dragging_animation(results)
             analyzer.create_power_extraction_animation(results)
         
-        print("\n=== 2D KEY RESULTS ===")
+        print(f"\n=== 2D {detected_type.upper()} RESULTS ===")  # Dynamic header
         if results['omega_theta_profiles']:
             latest_omega = results['omega_theta_profiles'][-1]
             omega_ratio = latest_omega['omega_ratio']

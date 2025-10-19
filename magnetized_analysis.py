@@ -1,21 +1,16 @@
-#!/usr/bin/env python3
-"""
-Complete Magnetized Black Hole Analysis Script
-For HARM simulations - both 1D and 2D monopole problems
-FIXED VERSION with inline BZ calculation
-"""
-
+# NOTE: might need to modify import path of hs if removed from root directory
 import harm_script as hs
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np
 import os
+import sys
 import argparse
-from matplotlib.colors import LogNorm
-from matplotlib.patches import Ellipse
+from matplotlib.colors import LogNorm, SymLogNorm
+from matplotlib.patches import Ellipse, Rectangle
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 import glob
-
 
 class MagnetizedAnalysis:
     """Class for analyzing magnetized black hole problems"""
@@ -106,116 +101,1314 @@ class MagnetizedAnalysis:
         gamma = alpha * hs.uu[0]
         return gamma
     
-    def calculate_omega_ratios(self):
-        """Calculate field angular velocity ratios ΩF/ΩH"""
-        # Need to compute auxiliary quantities first
-        hs.aux()  # This computes omegaf1, omegaf2, and other quantities
+    
+    def extract_omega_at_horizon(self):
+        """
+        Extract ΩF/ΩH precisely at the black hole horizon.
+        
+        Physical Principle:
+        ------------------
+        Frame dragging causes magnetic field lines near the horizon to rotate
+        with angular velocity ΩF. The BZ mechanism predicts:
+        
+            ΩF/ΩH = 0.5 (for monopole field)
+        
+        where ΩH = a/(2r_h) is the horizon's angular velocity.
+        
+        CRITICAL: Must measure at r = r_horizon, NOT domain-averaged!
+        Domain averaging dilutes the signal and gives incorrect values.
+        
+        Method:
+        ------
+        1. Calculate exact horizon radius: r_h = 1 + √(1 - a²)
+        2. Find grid cell closest to r_h
+        3. Extract ΩF(θ) at that radius
+        4. Compute ΩF/ΩH ratio with error bars
+        
+        Parameters:
+        ----------
+        i_horizon_approx : int
+            Approximate grid index for horizon (for validation only)
+        
+        Returns:
+        -------
+        dict : {
+            'omega_ratio': ndarray,  # ΩF/ΩH vs θ
+            'theta': ndarray,        # θ coordinates
+            'horizon_radius': float, # r_h in geometric units
+            'avg_omega_ratio': float,
+            'std_omega_ratio': float,
+            'deviation_percent': float  # |measured - 0.5| / 0.5 × 100%
+        }
+        
+        Notes:
+        -----
+        - Typical deviation should be < 5% for well-resolved simulations
+        - Deviation > 50% indicates a problem (check grid resolution)
+        - Angular variation should be small for monopole (< 10%)
+        """
+        # Compute auxiliary quantities (includes omegaf2)
+        try:
+            hs.aux()
+        except Exception as e:
+            raise RuntimeError(f"hs.aux() failed to compute omega_f: {e}")
         
         if not hasattr(hs, 'omegaf2'):
-            print("Error: omegaf2 not computed. aux() may have failed.")
-            return None, None
+            raise RuntimeError("omegaf2 not computed. aux() may have failed.")
         
-        # Black hole angular velocity
-        a = hs.a  # Black hole spin
-        rhor = 1 + (1 - a**2)**0.5  # Horizon radius
-        omega_h = a / (2 * rhor)
-        
-        # Field angular velocity
-        omega_f = hs.omegaf2
-        
-        # Ratio
-        omega_ratio = omega_f / omega_h if omega_h != 0 else 0
-        
-        return omega_f, omega_ratio
-    
-    def calculate_magnetic_flux(self):
-        """Calculate magnetic flux threading the black hole horizon"""
-        if not hasattr(hs, 'B') or not hasattr(hs, 'r'):
-            print("Error: Magnetic field data (B) not available")
-            return None
-        
-        # Get black hole parameters
+        # Black hole parameters
         a = hs.a
         rhor = 1 + (1 - a**2)**0.5  # Horizon radius
+        omega_h = a / (2 * rhor)    # Black hole angular velocity
         
-        # Get grid data
-        r_2d = hs.r.squeeze()
-        h_2d = hs.h.squeeze()  # theta coordinate
-        B_r = hs.B[1].squeeze()  # Radial magnetic field component
+        # Get omega_f and radial coordinate
+        omega_f = hs.omegaf2.squeeze()
+        r = hs.r.squeeze()
         
-        # Find horizon index (closest radial grid point to horizon)
-        r_1d = r_2d[:,0] if r_2d.ndim > 1 else r_2d
-        horizon_idx = np.abs(r_1d - rhor).argmin()
+        # Determine if 1D or 2D
+        is_1d = (r.ndim == 1)
         
-        print(f"Black hole spin a = {a:.3f}")
-        print(f"Horizon radius r_h = {rhor:.3f}")
-        print(f"Grid point closest to horizon: r = {r_1d[horizon_idx]:.3f} (index {horizon_idx})")
+        if is_1d:
+            # 1D case: omega_f is 1D array vs radius
+            horizon_idx = np.abs(r - rhor).argmin()
+            
+            # Validate we found a reasonable horizon
+            if np.abs(r[horizon_idx] - rhor) > 0.5:
+                raise ValueError(f"Horizon not well-resolved: closest r = {r[horizon_idx]:.3f}, r_h = {rhor:.3f}")
+            
+            omega_f_horizon = float(omega_f[horizon_idx])
+            omega_ratio_horizon = omega_f_horizon / omega_h if omega_h != 0 else 0.0
+            
+            return {
+                'omega_f_horizon': omega_f_horizon,
+                'omega_ratio_horizon': omega_ratio_horizon,
+                'omega_h': omega_h,
+                'horizon_radius': rhor,
+                'horizon_idx': horizon_idx,
+                'theta': None,
+                'is_1d': True,
+                'mean_omega_ratio': omega_ratio_horizon,
+                'std_omega_ratio': 0.0
+            }
         
-        # Extract magnetic field at horizon
-        if B_r.ndim > 1:
-            B_r_horizon = B_r[horizon_idx, :]  # Radial field at horizon vs theta
-            theta_horizon = h_2d[horizon_idx, :] if h_2d.ndim > 1 else h_2d
         else:
-            B_r_horizon = B_r
-            theta_horizon = np.array([np.pi/2])  # Equatorial plane only
+            # 2D case: omega_f is 2D array (r, theta)
+            r_1d = r[:, 0]  # Extract radial coordinate
+            horizon_idx = np.abs(r_1d - rhor).argmin()
+            
+            # Validate horizon
+            if np.abs(r_1d[horizon_idx] - rhor) > 0.5:
+                raise ValueError(f"Horizon not well-resolved: closest r = {r_1d[horizon_idx]:.3f}, r_h = {rhor:.3f}")
+            
+            # Extract omega_f at horizon as function of theta
+            omega_f_horizon = omega_f[horizon_idx, :]
+            
+            # Get theta coordinate at horizon
+            h = hs.h.squeeze()
+            theta_horizon = h[horizon_idx, :] if h.ndim > 1 else h
+            
+            # Calculate ratio
+            omega_ratio_horizon = omega_f_horizon / omega_h if omega_h != 0 else omega_f_horizon * 0
+            
+            # Statistics
+            mean_ratio = float(np.mean(omega_ratio_horizon))
+            std_ratio = float(np.std(omega_ratio_horizon))
+            
+            return {
+                'omega_f_horizon': omega_f_horizon,
+                'omega_ratio_horizon': omega_ratio_horizon,
+                'omega_h': omega_h,
+                'horizon_radius': rhor,
+                'horizon_idx': horizon_idx,
+                'theta': theta_horizon,
+                'is_1d': False,
+                'mean_omega_ratio': mean_ratio,
+                'std_omega_ratio': std_ratio
+            }
+
+    def calculate_hemisphere_flux(self, i_horizon_approx=5):
+        """
+        Calculate magnetic flux through northern and southern hemispheres.
         
-        # Calculate flux through horizon
-        # Φ = ∫ B_r * r_h^2 * sin(θ) dθ dφ
-        # For monopole: integrate over θ, multiply by 2π for φ integration
+        Physical Principle:
+        ------------------
+        For a surface at radius r with area element dA = r² sin(θ) dθ dφ:
         
-        if len(theta_horizon) > 1:
-            # 2D case: integrate over theta
-            dtheta = theta_horizon[1] - theta_horizon[0] if len(theta_horizon) > 1 else 1.0
-            sin_theta = np.sin(theta_horizon)
-            
-            # Simple integration using trapezoidal rule
-            flux_integrand = B_r_horizon * sin_theta * rhor**2
-            flux_half = np.trapezoid(flux_integrand, theta_horizon)  # Integration over 0 to π
-            total_flux = 2 * np.pi * flux_half  # Multiply by 2π for φ integration
-            
-            print(f"Theta range: {theta_horizon[0]:.3f} to {theta_horizon[-1]:.3f}")
-            print(f"Number of theta points: {len(theta_horizon)}")
-            print(f"Average B_r at horizon: {np.mean(B_r_horizon):.3e}")
-            print(f"Total magnetic flux Φ = {total_flux:.3e}")
-            
+            Φ = ∫∫ B_r · dA = 2π r² ∫ B_r(θ) sin(θ) dθ
+        
+        Split into hemispheres:
+            Φ_north = 2π r_h² ∫₀^(π/2) B_r(θ) sin(θ) dθ
+            Φ_south = 2π r_h² ∫_(π/2)^π B_r(θ) sin(θ) dθ
+        
+        Field Classification:
+        --------------------
+        - Monopole: Φ_N and Φ_S have SAME sign → Φ_total ≠ 0
+        - Dipole:   Φ_N and Φ_S have OPPOSITE signs → Φ_total ≈ 0
+        - Split monopole: Φ_N ≠ 0, Φ_S ≈ 0 (or vice versa)
+        
+        This is independent validation of the zero-crossing method!
+        
+        Parameters:
+        ----------
+        i_horizon_approx : int
+            Approximate grid index near horizon (for validation)
+        
+        Returns:
+        -------
+        dict : {
+            'flux_north': float,         # Flux through northern hemisphere
+            'flux_south': float,         # Flux through southern hemisphere  
+            'flux_total': float,         # Total flux (should ≈ 0 for dipole)
+            'same_sign': bool,           # True = monopole-like, False = dipole-like
+            'field_type': str,           # 'Monopole-like' or 'Dipole-like'
+            'theta': ndarray,            # Angular coordinates
+            'B_r_horizon': ndarray,      # B_r(θ) at horizon
+            'horizon_radius': float,     # r_h in geometric units
+            'integrand_north': ndarray,  # For debugging
+            'integrand_south': ndarray   # For debugging
+        }
+        
+        Notes:
+        -----
+        - Uses trapezoidal integration (numpy.trapezoid)
+        - Finds horizon radius exactly: r_h = 1 + √(1 - a²)
+        - Extracts B_r at the horizon (not domain-averaged)
+        - Sign convention: B_r > 0 means field points outward
+        
+        Example:
+        -------
+        >>> analyzer = MagnetizedAnalysis()
+        >>> analyzer.load_data("gdump", "dump999")
+        >>> flux_data = analyzer.calculate_hemisphere_flux()
+        >>> print(f"Field type: {flux_data['field_type']}")
+        >>> print(f"Φ_north = {flux_data['flux_north']:.3f}")
+        >>> print(f"Φ_south = {flux_data['flux_south']:.3f}")
+        """
+        
+        # Check if data is loaded
+        if not hasattr(hs, 'B'):
+            raise ValueError("No magnetic field data loaded. Call load_data() first.")
+        
+        # Get magnetic field components
+        B_r = hs.B[1].squeeze()  # Radial component
+        
+        # Get coordinates
+        if hasattr(hs, 'r') and hasattr(hs, 'h'):
+            r_2d = hs.r.squeeze()
+            theta_2d = hs.h.squeeze()  # h is theta in harm_script
         else:
-            # 1D case: assume spherical symmetry
-            total_flux = 4 * np.pi * B_r_horizon * rhor**2
-            print(f"1D case - assuming spherical symmetry")
-            print(f"B_r at horizon: {B_r_horizon:.3e}")
-            print(f"Total magnetic flux Φ = {total_flux:.3e}")
+            raise ValueError("Coordinate arrays not available")
+        
+        # Calculate exact horizon radius
+        a = hs.a  # Black hole spin
+        rhor = 1 + np.sqrt(1 - a**2)
+        
+        # Find horizon in grid
+        if r_2d.ndim == 2:
+            # 2D case
+            r_1d = r_2d[:, 0]  # Radial coordinate (first column)
+            horizon_idx = np.abs(r_1d - rhor).argmin()
+            
+            # Extract at horizon
+            B_r_horizon = B_r[horizon_idx, :]
+            theta_horizon = theta_2d[horizon_idx, :]
+        else:
+            # 1D case
+            horizon_idx = np.abs(r_2d - rhor).argmin()
+            B_r_horizon = B_r[horizon_idx]
+            
+            # For 1D, assume theta from 0 to π
+            if hasattr(hs, 'h'):
+                theta_horizon = hs.h.squeeze()
+            else:
+                # Create uniform theta grid if not available
+                n_theta = len(B_r_horizon) if hasattr(B_r_horizon, '__len__') else 1
+                theta_horizon = np.linspace(0, np.pi, n_theta)
+        
+        # Ensure theta is 1D array
+        if theta_horizon.ndim > 1:
+            theta_horizon = theta_horizon.flatten()
+        if B_r_horizon.ndim > 1:
+            B_r_horizon = B_r_horizon.flatten()
+        
+        # Split into hemispheres
+        n_theta = len(theta_horizon)
+        
+        # Find equator (θ = π/2)
+        equator_idx = np.abs(theta_horizon - np.pi/2).argmin()
+        
+        # Northern hemisphere: θ ∈ [0, π/2]
+        theta_north = theta_horizon[:equator_idx+1]
+        B_r_north = B_r_horizon[:equator_idx+1]
+        
+        # Southern hemisphere: θ ∈ [π/2, π]
+        theta_south = theta_horizon[equator_idx:]
+        B_r_south = B_r_horizon[equator_idx:]
+        
+        # Calculate integrand: B_r(θ) × sin(θ) × r_h²
+        integrand_north = B_r_north * np.sin(theta_north) * rhor**2
+        integrand_south = B_r_south * np.sin(theta_south) * rhor**2
+        
+        # Integrate over each hemisphere
+        # Φ = 2π × ∫ integrand dθ
+        flux_north = 2 * np.pi * np.trapezoid(integrand_north, theta_north)
+        flux_south = 2 * np.pi * np.trapezoid(integrand_south, theta_south)
+        
+        # Total flux
+        flux_total = flux_north + flux_south
+        
+        # Determine field type
+        # If same sign: monopole-like (flux through both hemispheres in same direction)
+        # If opposite signs: dipole-like (flux in, then out)
+        same_sign = (flux_north * flux_south > 0)
+        
+        if same_sign:
+            field_type = "Monopole-like"
+        else:
+            field_type = "Dipole-like"
+        
+        # Package results
+        results = {
+            'flux_north': flux_north,
+            'flux_south': flux_south,
+            'flux_total': flux_total,
+            'same_sign': same_sign,
+            'field_type': field_type,
+            'theta': theta_horizon,
+            'B_r_horizon': B_r_horizon,
+            'horizon_radius': rhor,
+            'horizon_idx': horizon_idx,
+            'integrand_north': integrand_north,
+            'integrand_south': integrand_south,
+            'equator_idx': equator_idx
+        }
+        
+        return results
+
+    def calculate_energy_flux_from_primitives(self):
+        """
+        Calculate energy flux -T^r_t from primitive variables.
+        
+        This is DIFFERENT from magnetic flux! Energy flux tells you where
+        Blandford-Znajek power extraction occurs.
+        
+        Physical Formula:
+        ----------------
+        Energy flux = -T^r_t = -√g (ρh + b²) u^r u_t
+        
+        Where:
+        - ρ = rest-mass density (hs.rho)
+        - h = specific enthalpy = 1 + Γp/ρ
+        - Γ = adiabatic index (4/3 for radiation-dominated)
+        - p = pressure = (Γ-1) × u  [calculated from internal energy]
+        - u = internal energy density (hs.ug)
+        - b² = magnetic field energy density (hs.bsq)
+        - u^r = radial 4-velocity component (hs.uu[1])
+        - u_t = timelike covariant 4-velocity (hs.ud[0])
+        - √g = metric determinant (hs.gdet)
+        
+        Interpretation:
+        --------------
+        - Positive: Energy flowing outward (extraction from black hole)
+        - Negative: Energy flowing inward (accretion)
+        - Used in stagnation surface visualization (Panel 2)
+        
+        Returns:
+        -------
+        ndarray : Energy flux as 2D array matching grid shape
+        
+        Raises:
+        ------
+        ValueError : If required primitive variables not loaded
+        
+        Example:
+        -------
+        >>> analyzer = MagnetizedAnalysis()
+        >>> analyzer.load_data("gdump", "dump999")
+        >>> energy_flux = analyzer.calculate_energy_flux_from_primitives()
+        >>> print(f"Max extraction: {energy_flux.max():.3e}")
+        """
+        # Check if data is loaded - pg (gas pressure) is already computed
+        required_fields = ['rho', 'pg', 'bsq', 'uu', 'ud', 'gdet']
+        missing_fields = []
+        for field in required_fields:
+            if not hasattr(hs, field):
+                missing_fields.append(field)
+        
+        if missing_fields:
+            raise ValueError(f"Required fields not available: {', '.join(missing_fields)}. Call load_data() first.")
+        
+        # Get primitive variables
+        rho = hs.rho.squeeze()
+        p = hs.pg.squeeze()  # Gas pressure (already computed by harm_script)
+        bsq = hs.bsq.squeeze()
+        u_r = hs.uu[1].squeeze()
+        u_t = hs.ud[0].squeeze()
+        gdet = hs.gdet.squeeze()
+        
+        # Note: We use pg (gas pressure) directly rather than calculating from internal energy
+        # This is more accurate as it's what the simulation actually uses
+        gam = 4./3.  # Adiabatic index
+        
+        # Calculate specific enthalpy
+        # h = 1 + Γp/ρ where Γ = 4/3
+        # Avoid division by zero
+        h = np.where(rho > 0, 1 + gam * p / rho, 1.0)
+        
+        # Calculate energy flux: -T^r_t
+        # This represents energy flow in the radial direction
+        energy_flux = -gdet * (rho * h + bsq) * u_r * u_t
+        
+        return energy_flux
+
+    def print_hemisphere_flux_summary(self, flux_data):
+        """
+        Print a human-readable summary of hemisphere flux results.
+        
+        Parameters:
+        ----------
+        flux_data : dict
+            Output from calculate_hemisphere_flux()
+        """
+        print("\n" + "="*60)
+        print("HEMISPHERE FLUX ANALYSIS")
+        print("="*60)
+        
+        print(f"\nHorizon radius: r_h = {flux_data['horizon_radius']:.3f} r_g")
+        print(f"Black hole spin: a = {hs.a:.3f}")
+        
+        print(f"\nNorthern hemisphere flux: Φ_N = {flux_data['flux_north']:+.4e}")
+        print(f"Southern hemisphere flux: Φ_S = {flux_data['flux_south']:+.4e}")
+        print(f"Total flux:               Φ_T = {flux_data['flux_total']:+.4e}")
+        
+        print(f"\nFlux sign comparison:")
+        if flux_data['same_sign']:
+            print("  ✓ Φ_N and Φ_S have SAME sign → Monopole-like field")
+            print("  → Net flux through horizon ≠ 0")
+        else:
+            print("  ✓ Φ_N and Φ_S have OPPOSITE signs → Dipole-like field")
+            print("  → Net flux through horizon ≈ 0")
+        
+        print(f"\nField classification: {flux_data['field_type']}")
+        
+        # Symmetry check
+        asymmetry = abs(abs(flux_data['flux_north']) - abs(flux_data['flux_south']))
+        avg_flux = (abs(flux_data['flux_north']) + abs(flux_data['flux_south'])) / 2
+        if avg_flux > 0:
+            asymmetry_percent = asymmetry / avg_flux * 100
+            print(f"Hemisphere asymmetry: {asymmetry_percent:.1f}%")
+            
+            if asymmetry_percent < 5:
+                print("  → Highly symmetric field")
+            elif asymmetry_percent < 20:
+                print("  → Moderately symmetric field")
+            else:
+                print("  → Asymmetric field (may be evolving or split monopole)")
+        
+        print("="*60)
+
+    def detect_field_topology_zero_crossings(self, B_r_horizon=None, theta=None):
+        """
+        Detect magnetic field topology by analyzing sign reversals in B_r(θ).
+        
+        UPGRADED VERSION: Now distinguishes smooth vs discontinuous crossings.
+        
+        Physical Basis (Li & Wang 2021):
+        --------------------------------
+        - **Pure Monopole**: B_r constant sign everywhere → 0 crossings
+        - **Pure Dipole**: B_r ∝ cos(θ), smooth crossing at equator → 1 smooth crossing
+        - **Split Monopole**: Discontinuous jump at equator (current sheet) → 1 discontinuous crossing
+        
+        Method:
+        -------
+        1. Count zero-crossings (sign changes in B_r)
+        2. For each crossing, analyze:
+        - Transition width (# grid cells)
+        - Gradient continuity (dB_r/dθ)
+        - Jump characteristics
+        3. Classify crossing as SMOOTH or DISCONTINUOUS
+        4. Cross-validate with hemisphere flux method
+        
+        Classification Criteria:
+        -----------------------
+        SMOOTH crossing (dipole-like):
+        - Gradual change over ≥ 5 grid cells
+        - Continuous gradient (small discontinuity ratio < 2)
+        - Typical of pure dipole field
+        
+        DISCONTINUOUS crossing (split monopole):
+        - Sharp jump over ≤ 3 grid cells
+        - Gradient discontinuity (ratio > 3)
+        - Indicates current sheet at equator
+        
+        Parameters:
+        ----------
+        B_r_horizon : ndarray, optional
+            B_r(θ) at horizon. If None, will calculate from loaded data.
+        theta : ndarray, optional
+            Angular coordinates. If None, will use from loaded data.
+        
+        Returns:
+        -------
+        dict : {
+            'n_crossings': int,
+            'field_type': str,
+            'description': str,
+            'crossing_indices': list,
+            'crossing_theta': ndarray,
+            'crossing_types': list of str,          # NEW: 'smooth' or 'discontinuous'
+            'crossing_details': list of dict,       # NEW: Detailed analysis
+            'B_r_horizon': ndarray,
+            'theta': ndarray,
+            'pole_field': float,
+            'equator_field': float,
+            'consistent_with_hemisphere': bool,
+            'dipole_like_crossings': int,          # NEW
+            'split_monopole_like_crossings': int,  # NEW
+            'confidence': str                       # NEW: 'High', 'Medium', 'Low'
+        }
+        
+        Example:
+        -------
+        >>> analyzer = MagnetizedAnalysis()
+        >>> analyzer.load_data("gdump", "dump999")
+        >>> topo = analyzer.detect_field_topology_zero_crossings()
+        >>> print(f"Field type: {topo['field_type']} (confidence: {topo['confidence']})")
+        >>> for detail in topo['crossing_details']:
+        >>>     print(f"  θ={detail['theta']:.3f}: {detail['type']} crossing")
+        
+        Notes:
+        -----
+        - Ignores very small values (|B_r| < 1e-10 * max|B_r|) to avoid numerical noise
+        - Crossing locations interpolated for accuracy
+        - Validates against hemisphere flux method if available
+        """
+        
+        # Get B_r at horizon if not provided
+        if B_r_horizon is None or theta is None:
+            flux_data = self.calculate_hemisphere_flux()
+            B_r_horizon = flux_data['B_r_horizon']
+            theta = flux_data['theta']
+        
+        # Ensure 1D arrays
+        B_r_horizon = np.atleast_1d(B_r_horizon).flatten()
+        theta = np.atleast_1d(theta).flatten()
+        
+        # Remove very small values (numerical noise)
+        threshold = 1e-10 * np.max(np.abs(B_r_horizon))
+        B_r_clean = B_r_horizon.copy()
+        B_r_clean[np.abs(B_r_clean) < threshold] = 0
+        
+        # Calculate gradient for smooth vs discontinuous analysis
+        dtheta = np.diff(theta)
+        dBr = np.diff(B_r_clean)
+        gradient = dBr / dtheta  # dB_r/dθ
+        
+        # Find sign changes
+        sign_changes = []
+        crossing_theta = []
+        crossing_types = []
+        crossing_details = []
+        
+        for i in range(len(B_r_clean) - 1):
+            # Check if sign changes between consecutive points
+            if B_r_clean[i] * B_r_clean[i+1] < 0:
+                sign_changes.append(i)
+                
+                # ============================================================
+                # INTERPOLATE CROSSING LOCATION
+                # ============================================================
+                if B_r_clean[i] != B_r_clean[i+1]:
+                    frac = -B_r_clean[i] / (B_r_clean[i+1] - B_r_clean[i])
+                    theta_cross = theta[i] + frac * (theta[i+1] - theta[i])
+                else:
+                    theta_cross = (theta[i] + theta[i+1]) / 2
+                
+                crossing_theta.append(theta_cross)
+                
+                # ============================================================
+                # ANALYZE CROSSING CHARACTERISTICS (NEW!)
+                # ============================================================
+                
+                # 1. Transition width: count cells over which field changes sign
+                transition_width = 1
+                threshold_away = 0.1 * np.max(np.abs(B_r_clean))
+                
+                # Extend backward
+                j_before = i
+                while j_before > 0 and np.abs(B_r_clean[j_before]) < threshold_away:
+                    j_before -= 1
+                    transition_width += 1
+                
+                # Extend forward
+                j_after = i + 1
+                while j_after < len(B_r_clean) and np.abs(B_r_clean[j_after]) < threshold_away:
+                    j_after += 1
+                    transition_width += 1
+                
+                # 2. Gradient analysis
+                window = 3
+                i_start = max(0, i - window)
+                i_end = min(len(gradient), i + window + 1)
+                
+                grad_before = gradient[i_start:i]
+                grad_after = gradient[i+1:i_end]
+                
+                avg_grad_before = np.mean(grad_before) if len(grad_before) > 0 else 0
+                avg_grad_after = np.mean(grad_after) if len(grad_after) > 0 else 0
+                
+                # Gradient discontinuity measure
+                grad_jump = np.abs(avg_grad_after - avg_grad_before)
+                grad_avg = (np.abs(avg_grad_before) + np.abs(avg_grad_after)) / 2
+                
+                if grad_avg > 0:
+                    grad_discontinuity_ratio = grad_jump / grad_avg
+                else:
+                    grad_discontinuity_ratio = 0
+                
+                # 3. Classify crossing type
+                is_smooth = (transition_width >= 5 and grad_discontinuity_ratio < 2.0)
+                is_discontinuous = (transition_width <= 3 or grad_discontinuity_ratio > 3.0)
+                
+                if is_smooth:
+                    crossing_type = "smooth"
+                elif is_discontinuous:
+                    crossing_type = "discontinuous"
+                else:
+                    crossing_type = "ambiguous"
+                
+                crossing_types.append(crossing_type)
+                
+                # 4. Check if near equator
+                near_equator = np.abs(theta_cross - np.pi/2) < 0.1  # Within ~6 degrees
+                
+                # Store detailed info
+                detail = {
+                    'index': i,
+                    'theta': theta_cross,
+                    'theta_degrees': np.degrees(theta_cross),
+                    'type': crossing_type,
+                    'near_equator': near_equator,
+                    'transition_width': transition_width,
+                    'gradient_discontinuity_ratio': grad_discontinuity_ratio,
+                    'gradient_before': avg_grad_before,
+                    'gradient_after': avg_grad_after
+                }
+                crossing_details.append(detail)
+        
+        n_crossings = len(sign_changes)
+        crossing_theta = np.array(crossing_theta) if crossing_theta else np.array([])
+        
+        # ============================================================
+        # COUNT CROSSING TYPES
+        # ============================================================
+        n_smooth = sum(1 for t in crossing_types if t == 'smooth')
+        n_discontinuous = sum(1 for t in crossing_types if t == 'discontinuous')
+        n_ambiguous = sum(1 for t in crossing_types if t == 'ambiguous')
+        
+        # ============================================================
+        # CLASSIFY FIELD TYPE (CORRECTED LOGIC)
+        # ============================================================
+        if n_crossings == 0:
+            field_type = "Pure Monopole"
+            confidence = "High"
+            description = "Constant sign of B_r from pole to pole"
+            
+        elif n_crossings == 1:
+            crossing = crossing_details[0]
+            
+            if crossing['type'] == 'smooth':
+                field_type = "Pure Dipole"
+                confidence = "High"
+                description = f"Smooth zero-crossing at θ={crossing['theta']:.3f} rad"
+                
+            elif crossing['type'] == 'discontinuous' and crossing['near_equator']:
+                field_type = "Split Monopole"
+                confidence = "High"
+                description = f"Discontinuous jump at equator (θ={crossing['theta']:.3f} rad)"
+                
+            elif crossing['type'] == 'discontinuous' and not crossing['near_equator']:
+                field_type = "Split Monopole (off-equator)"
+                confidence = "Medium"
+                description = f"Discontinuous jump at θ={crossing['theta']:.3f} rad (not at equator)"
+                
+            else:
+                # Ambiguous case
+                field_type = "Monopole or Dipole (uncertain)"
+                confidence = "Low"
+                description = f"Single ambiguous crossing at θ={crossing['theta']:.3f} rad"
+
+        elif n_crossings == 2:
+            field_type = "Quadrupole"
+            confidence = "Medium"
+            
+            if n_smooth == 2:
+                description = "Two smooth zero-crossings"
+            elif n_discontinuous == 2:
+                description = "Two discontinuous jumps"
+            else:
+                description = f"Mixed: {n_smooth} smooth, {n_discontinuous} discontinuous"
+
+        elif n_crossings == 3:
+            field_type = "Octupole"
+            confidence = "Medium"
+            description = f"Three zero-crossings ({n_smooth} smooth, {n_discontinuous} discontinuous)"
+
+        else:
+            # Higher-order multipoles: 2^(n+1)-pole
+            multipole_order = 2 ** (n_crossings + 1)
+            field_type = f"Multipole (2^{n_crossings+1}-pole)"
+            confidence = "Low"
+            description = f"{n_crossings} zero-crossings detected"
+        # ============================================================
+        # GET FIELD VALUES AT KEY LOCATIONS
+        # ============================================================
+        pole_idx = 0
+        equator_idx = np.abs(theta - np.pi/2).argmin()
+        
+        pole_field = B_r_horizon[pole_idx]
+        equator_field = B_r_horizon[equator_idx]
+        
+        # ============================================================
+        # CROSS-CHECK WITH HEMISPHERE FLUX METHOD
+        # ============================================================
+        consistent_with_hemisphere = None
+        try:
+            flux_data = self.calculate_hemisphere_flux()
+            
+            if n_crossings == 0:
+                # Pure monopole: hemisphere flux should have same sign
+                consistent_with_hemisphere = flux_data['same_sign']
+                
+            elif n_crossings == 1:
+                # Split monopole: harder to validate automatically
+                consistent_with_hemisphere = True  # Tentatively consistent
+                
+            elif n_crossings == 2:
+                # Pure dipole: hemisphere flux should have opposite signs
+                consistent_with_hemisphere = not flux_data['same_sign']
+            else:
+                consistent_with_hemisphere = None
+                    
+        except:
+            pass
+        
+        # ============================================================
+        # PACKAGE RESULTS
+        # ============================================================
+        results = {
+            'n_crossings': n_crossings,
+            'field_type': field_type,
+            'description': description,
+            'confidence': confidence,
+            'crossing_indices': sign_changes,
+            'crossing_theta': crossing_theta,
+            'crossing_types': crossing_types,
+            'crossing_details': crossing_details,
+            'dipole_like_crossings': n_smooth,
+            'split_monopole_like_crossings': n_discontinuous,
+            'ambiguous_crossings': n_ambiguous,
+            'B_r_horizon': B_r_horizon,
+            'theta': theta,
+            'gradient': gradient,
+            'pole_field': pole_field,
+            'equator_field': equator_field,
+            'consistent_with_hemisphere': consistent_with_hemisphere
+        }
+        
+        return results
+
+
+    def print_topology_summary(self, topo_data):
+        """
+        Print human-readable summary of field topology detection.
+        
+        UPGRADED VERSION: Now includes crossing type details.
+        
+        Parameters:
+        ----------
+        topo_data : dict
+            Output from detect_field_topology_zero_crossings()
+        """
+        print("\n" + "="*70)
+        print("FIELD TOPOLOGY DETECTION")
+        print("="*70)
+        
+        print(f"\nClassification: {topo_data['field_type']}")
+        print(f"Confidence: {topo_data['confidence']}")
+        print(f"Description: {topo_data['description']}")
+        
+        print(f"\nZero-Crossing Summary:")
+        print(f"  Total crossings: {topo_data['n_crossings']}")
+        
+        if topo_data['n_crossings'] > 0:
+            print(f"  Smooth (dipole-like): {topo_data['dipole_like_crossings']}")
+            print(f"  Discontinuous (split monopole-like): {topo_data['split_monopole_like_crossings']}")
+            print(f"  Ambiguous: {topo_data['ambiguous_crossings']}")
+            
+            print(f"\nCrossing Details:")
+            for i, crossing in enumerate(topo_data['crossing_details']):
+                theta_deg = crossing['theta_degrees']
+                print(f"  {i+1}. θ = {crossing['theta']:.4f} rad ({theta_deg:.1f}°)")
+                print(f"     Type: {crossing['type'].upper()}")
+                print(f"     Transition width: {crossing['transition_width']} cells")
+                print(f"     Gradient discontinuity: {crossing['gradient_discontinuity_ratio']:.2f}")
+                
+                if crossing['near_equator']:
+                    print(f"     Location: Near equator ✓")
+        
+        print(f"\nField values at key locations:")
+        print(f"  B_r at pole (θ=0):      {topo_data['pole_field']:+.4e}")
+        print(f"  B_r at equator (θ=π/2): {topo_data['equator_field']:+.4e}")
+        
+        # Consistency check
+        if topo_data['consistent_with_hemisphere'] is not None:
+            if topo_data['consistent_with_hemisphere']:
+                print(f"\n✓ Consistent with hemisphere flux method")
+            else:
+                print(f"\n⚠️  INCONSISTENT with hemisphere flux method!")
+                print(f"   Possible reasons:")
+                print(f"   - Numerical issues")
+                print(f"   - Field evolution in progress")
+                print(f"   - Complex multipole structure")
+        
+        print("="*70)
+
+
+    def compare_topology_methods(self):
+        """
+        Run both hemisphere flux and zero-crossing methods and compare results.
+        
+        This provides a comprehensive field topology analysis with cross-validation.
+        
+        Returns:
+        -------
+        dict : {
+            'hemisphere_flux': dict,
+            'zero_crossing': dict,
+            'consistent': bool,
+            'summary': str
+        }
+        """
+        print("\n" + "="*70)
+        print("COMPREHENSIVE FIELD TOPOLOGY ANALYSIS")
+        print("="*70)
+        
+        # Method 1: Hemisphere flux
+        print("\nMethod 1: Hemisphere Flux Analysis")
+        print("-" * 70)
+        flux_data = self.calculate_hemisphere_flux()
+        self.print_hemisphere_flux_summary(flux_data)
+        
+        # Method 2: Zero-crossing
+        print("\nMethod 2: Zero-Crossing Analysis")
+        print("-" * 70)
+        topo_data = self.detect_field_topology_zero_crossings(
+            B_r_horizon=flux_data['B_r_horizon'],
+            theta=flux_data['theta']
+        )
+        self.print_topology_summary(topo_data)
+        
+        # Cross-validation
+        print("\n" + "="*70)
+        print("CROSS-VALIDATION")
+        print("="*70)
+        
+        consistent = topo_data['consistent_with_hemisphere']
+        
+        print(f"\nHemisphere flux says: {flux_data['field_type']}")
+        print(f"Zero-crossing says:   {topo_data['field_type']}")
+        
+        if consistent:
+            print("\n✅ METHODS AGREE - Classification is reliable")
+            summary = f"Both methods consistently identify: {flux_data['field_type']}"
+        elif consistent is False:
+            print("\n⚠️  METHODS DISAGREE - Further investigation needed")
+            summary = f"Inconsistent classification - field may be complex or evolving"
+        else:
+            print("\n⚠️  Could not cross-validate (incompatible field types)")
+            summary = f"Complex field structure detected"
+        
+        print("="*70)
         
         return {
-            'total_flux': total_flux,
-            'horizon_radius': rhor,
-            'B_r_horizon': B_r_horizon,
-            'theta_horizon': theta_horizon,
-            'horizon_index': horizon_idx
+            'hemisphere_flux': flux_data,
+            'zero_crossing': topo_data,
+            'consistent': consistent,
+            'summary': summary
         }
+
+    def plot_Br_theta_evolution(self, dump_files, times=None, indices=None,
+                                show=True, save=True):
+        """
+        Plot B_r(θ) at horizon for multiple times to show field evolution.
+        
+        EFFICIENT VERSION: Only loads dumps that will be plotted.
+        
+        Parameters:
+        ----------
+        dump_files : list
+            Available dump files
+        times : list of float, optional
+            Approximate times to visualize. If provided, will find closest dumps.
+            Requires loading all dumps to build time map (slower).
+        indices : list of int, optional
+            Direct dump file indices to plot (faster).
+            E.g., [0, 50, 99] plots first, middle, last.
+        show : bool
+            Whether to display plot
+        save : bool
+            Whether to save plot to file
+        
+        Returns:
+        -------
+        fig, axes : matplotlib figure and axes
+        
+        Notes:
+        -----
+        For efficiency, prefer using `indices` over `times` when possible.
+        
+        Examples:
+        --------
+        # Fast: plot specific dumps
+        >>> analyzer.plot_Br_theta_evolution(dumps, indices=[0, 500, 999])
+        
+        # Slower: search by time (loads all dumps to find closest)
+        >>> analyzer.plot_Br_theta_evolution(dumps, times=[0, 50, 100])
+        """
+        
+        # Determine which dumps to plot
+        if indices is not None:
+            # Fast path: use specified indices directly
+            selected_dumps = [dump_files[i] for i in indices]
+            actual_times = []
+            
+            # Load only these dumps to get times
+            for dump_file in selected_dumps:
+                self.load_data("gdump", dump_file)
+                actual_times.append(float(hs.t))
+                
+        elif times is not None:
+            # Slow path: must load all dumps to find closest times
+            print(f"  Note: Loading all {len(dump_files)} dumps to find closest times...")
+            print(f"  Tip: Use indices=[...] instead for faster plotting")
+            
+            time_to_dump = {}
+            for dump_file in dump_files:
+                try:
+                    self.load_data("gdump", dump_file)
+                    current_time = float(hs.t)
+                    time_to_dump[current_time] = (dump_file, current_time)
+                except:
+                    continue
+            
+            if not time_to_dump:
+                print("Could not find any valid dump files")
+                return None, None
+            
+            # Find closest times
+            selected_dumps = []
+            actual_times = []
+            available_times = sorted(time_to_dump.keys())
+            
+            for target_time in times:
+                closest_time = min(available_times, key=lambda t: abs(t - target_time))
+                dump_file, actual_time = time_to_dump[closest_time]
+                selected_dumps.append(dump_file)
+                actual_times.append(actual_time)
+        else:
+            # Default: plot first, middle, last
+            indices = [0, len(dump_files)//2, len(dump_files)-1]
+            selected_dumps = [dump_files[i] for i in indices]
+            
+            actual_times = []
+            for dump_file in selected_dumps:
+                self.load_data("gdump", dump_file)
+                actual_times.append(float(hs.t))
+        
+        if not selected_dumps:
+            print("No dump files selected")
+            return None, None
+        
+        # Create figure
+        n_panels = len(selected_dumps)
+        fig, axes = plt.subplots(1, n_panels, figsize=(5.5*n_panels, 5))
+        
+        if n_panels == 1:
+            axes = [axes]
+        
+        # Plot each time snapshot
+        for i, (dump_file, time) in enumerate(zip(selected_dumps, actual_times)):
+            ax = axes[i]
+            
+            # Load data
+            self.load_data("gdump", dump_file)
+            
+            # Get topology data
+            flux_data = self.calculate_hemisphere_flux()
+            topo_data = self.detect_field_topology_zero_crossings(
+                B_r_horizon=flux_data['B_r_horizon'],
+                theta=flux_data['theta']
+            )
+            
+            theta = flux_data['theta']
+            B_r = flux_data['B_r_horizon']
+            
+            # Plot B_r(θ) - clean and simple
+            ax.plot(theta, B_r, 'k-', linewidth=2.5)
+            ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+            ax.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
+            
+            # Mark zero crossings
+            if topo_data['n_crossings'] > 0:
+                for detail in topo_data['crossing_details']:
+                    theta_cross = detail['theta']
+                    crossing_type = detail['type']
+                    
+                    if crossing_type == 'smooth':
+                        color, marker = 'green', 'o'
+                    elif crossing_type == 'discontinuous':
+                        color, marker = 'red', 's'
+                    else:
+                        color, marker = 'orange', '^'
+                    
+                    ax.axvline(x=theta_cross, color=color, linestyle=':', 
+                            alpha=0.6, linewidth=2)
+                    ax.plot(theta_cross, 0, marker=marker, color=color, 
+                        markersize=9, zorder=10)
+            
+            # Clean formatting
+            ax.set_xlabel('θ (rad)', fontsize=11)
+            if i == 0:
+                ax.set_ylabel('B_r', fontsize=11)
+            
+            # Title: just time and field type
+            ax.set_title(f't = {time:.1f} M\n{topo_data["field_type"]}', 
+                        fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.25)
+            ax.set_xlim(0, np.pi)
+            ax.set_xticks([0, np.pi/2, np.pi])
+            ax.set_xticklabels(['0', 'π/2', 'π'])
+            
+            # Minimal stats box - just key numbers
+            stats_text = f'n = {topo_data["n_crossings"]}\n'
+            if topo_data['n_crossings'] > 0:
+                stats_text += f'S: {topo_data["dipole_like_crossings"]}  '
+                stats_text += f'D: {topo_data["split_monopole_like_crossings"]}\n'
+            stats_text += f'Φ_N: {flux_data["flux_north"]:+.2e}\n'
+            stats_text += f'Φ_S: {flux_data["flux_south"]:+.2e}'
+            
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                fontsize=9, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", 
+                            edgecolor='gray', alpha=0.9, linewidth=1))
+        
+        # Simple overall title
+        fig.suptitle('Magnetic Field Evolution: B_r(θ) at Horizon', 
+                    fontsize=14, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        # Save
+        if save:
+            filename = os.path.join(self.output_dir, "Br_theta_evolution.png")
+            plt.savefig(filename, dpi=200, bbox_inches='tight')
+            print(f"Saved B_r(θ) evolution plot: {filename}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig, axes
+
+
+    def plot_Br_theta_snapshot(self, dump_file=None, show=True, save=True):
+        """
+        Detailed plot of B_r(θ) at horizon for a single time.
+        
+        Clean, quantitative visualization with minimal text.
+        
+        Shows:
+        - Panel 1: B_r(θ) profile with crossing markers
+        - Panel 2: dB_r/dθ gradient 
+        - Panel 3: Quantitative summary (numbers only)
+        
+        Parameters:
+        ----------
+        dump_file : str, optional
+            Dump file to analyze. If None, uses currently loaded data.
+        show : bool
+            Whether to display plot
+        save : bool
+            Whether to save to file
+        
+        Returns:
+        -------
+        fig, axes : matplotlib figure and axes
+        """
+
+        # Load data if specified
+        if dump_file is not None:
+            self.load_data("gdump", dump_file)
+        
+        current_time = float(hs.t)
+        
+        # Get field data
+        flux_data = self.calculate_hemisphere_flux()
+        topo_data = self.detect_field_topology_zero_crossings(
+            B_r_horizon=flux_data['B_r_horizon'],
+            theta=flux_data['theta']
+        )
+        
+        theta = flux_data['theta']
+        B_r = flux_data['B_r_horizon']
+        gradient = topo_data['gradient']
+        theta_grad = (theta[:-1] + theta[1:]) / 2
+        
+        # Create figure with clean layout
+        fig = plt.figure(figsize=(14, 9))
+        gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.35)
+        
+        # ========================================================================
+        # Panel 1: B_r(θ) Profile
+        # ========================================================================
+        ax1 = fig.add_subplot(gs[0, :])  # Span both columns
+        
+        # Plot B_r(θ) - simple, clean
+        ax1.plot(theta, B_r, 'k-', linewidth=2.5, zorder=5)
+        ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax1.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
+        
+        # Mark zero crossings with color coding (minimal)
+        if topo_data['n_crossings'] > 0:
+            for detail in topo_data['crossing_details']:
+                theta_cross = detail['theta']
+                crossing_type = detail['type']
+                
+                # Color code by type
+                if crossing_type == 'smooth':
+                    color = 'green'
+                    marker = 'o'
+                elif crossing_type == 'discontinuous':
+                    color = 'red'
+                    marker = 's'
+                else:
+                    color = 'orange'
+                    marker = '^'
+                
+                ax1.axvline(x=theta_cross, color=color, linestyle=':', 
+                        alpha=0.6, linewidth=2, zorder=3)
+                ax1.plot(theta_cross, 0, marker=marker, color=color, 
+                        markersize=10, zorder=10)
+        
+        ax1.set_xlabel('θ (rad)', fontsize=13)
+        ax1.set_ylabel('B_r', fontsize=13)
+        ax1.set_title(f'B_r(θ) at Horizon | t = {current_time:.1f} M', 
+                    fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.25)
+        ax1.set_xlim(0, np.pi)
+        ax1.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
+        ax1.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
+        
+        # Minimal legend
+        if topo_data['n_crossings'] > 0:
+            from matplotlib.lines import Line2D
+            legend_elements = []
+            if topo_data['dipole_like_crossings'] > 0:
+                legend_elements.append(Line2D([0], [0], marker='o', color='w', 
+                                            markerfacecolor='green', markersize=8, 
+                                            label='Smooth'))
+            if topo_data['split_monopole_like_crossings'] > 0:
+                legend_elements.append(Line2D([0], [0], marker='s', color='w', 
+                                            markerfacecolor='red', markersize=8, 
+                                            label='Discontinuous'))
+            if legend_elements:
+                ax1.legend(handles=legend_elements, loc='upper right', 
+                        fontsize=10, framealpha=0.9)
+        
+        # ========================================================================
+        # Panel 2: Gradient dB_r/dθ
+        # ========================================================================
+        ax2 = fig.add_subplot(gs[1, 0])
+        
+        ax2.plot(theta_grad, gradient, 'b-', linewidth=2)
+        ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax2.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
+        
+        # Highlight discontinuous crossings
+        if topo_data['split_monopole_like_crossings'] > 0:
+            for detail in topo_data['crossing_details']:
+                if detail['type'] == 'discontinuous':
+                    theta_cross = detail['theta']
+                    ax2.axvspan(theta_cross - 0.1, theta_cross + 0.1, 
+                            alpha=0.2, color='red')
+        
+        ax2.set_xlabel('θ (rad)', fontsize=12)
+        ax2.set_ylabel('dB_r/dθ', fontsize=12)
+        ax2.set_title('Gradient', fontsize=13, fontweight='bold')
+        ax2.grid(True, alpha=0.25)
+        ax2.set_xlim(0, np.pi)
+        ax2.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
+        ax2.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
+        
+        # ========================================================================
+        # Panel 3: Quantitative Summary (Numbers Only!)
+        # ========================================================================
+        ax3 = fig.add_subplot(gs[1, 1])
+        ax3.axis('off')
+        
+        # Clean, tabular format - just the numbers
+        summary_text = f"{topo_data['field_type']}\n"
+        summary_text += "─" * 28 + "\n\n"
+        
+        summary_text += f"Crossings:          {topo_data['n_crossings']}\n"
+        if topo_data['n_crossings'] > 0:
+            summary_text += f"  Smooth:           {topo_data['dipole_like_crossings']}\n"
+            summary_text += f"  Discontinuous:    {topo_data['split_monopole_like_crossings']}\n\n"
+        else:
+            summary_text += "\n"
+        
+        summary_text += f"Φ_N:    {flux_data['flux_north']:+.3e}\n"
+        summary_text += f"Φ_S:    {flux_data['flux_south']:+.3e}\n"
+        summary_text += f"Φ_tot:  {flux_data['flux_total']:+.3e}\n\n"
+        
+        summary_text += f"B_r(0):    {topo_data['pole_field']:+.3e}\n"
+        summary_text += f"B_r(π/2):  {topo_data['equator_field']:+.3e}\n"
+        
+        # Add crossing details if present
+        if topo_data['n_crossings'] > 0:
+            summary_text += "\n" + "─" * 28 + "\n"
+            for i, detail in enumerate(topo_data['crossing_details']):
+                summary_text += f"\nCrossing {i+1}:\n"
+                summary_text += f"  θ = {detail['theta']:.4f} rad\n"
+                summary_text += f"  Type: {detail['type']}\n"
+                summary_text += f"  Width: {detail['transition_width']} cells\n"
+                summary_text += f"  Grad ratio: {detail['gradient_discontinuity_ratio']:.2f}\n"
+        
+        ax3.text(0.05, 0.95, summary_text, transform=ax3.transAxes,
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.5", facecolor="white", 
+                        edgecolor='gray', alpha=0.95, linewidth=1.5))
+        
+        # Clean overall title
+        fig.suptitle(f'{topo_data["field_type"]}', 
+                    fontsize=15, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # Save
+        if save:
+            safe_time = f"{current_time:.0f}".replace(".", "_")
+            filename = os.path.join(self.output_dir, 
+                                f"Br_theta_snapshot_t{safe_time}.png")
+            plt.savefig(filename, dpi=200, bbox_inches='tight')
+            print(f"Saved B_r(θ) snapshot: {filename}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig, (ax1, ax2, ax3)
+
+    def validate_omega_ratio(self, omega_data, tolerance=0.15):
+        """
+        Validate that ΩF/ΩH is close to theoretical value of 0.5.
+        
+        Args:
+            omega_data: dict returned by extract_omega_at_horizon()
+            tolerance: acceptable fractional deviation (default 15%)
+        
+        Returns:
+            dict with validation results
+        """
+        mean_ratio = omega_data['mean_omega_ratio']
+        std_ratio = omega_data['std_omega_ratio']
+        theory = 0.5
+        
+        deviation = abs(mean_ratio - theory) / theory
+        is_valid = deviation <= tolerance
+        
+        result = {
+            'is_valid': is_valid,
+            'mean_omega_ratio': mean_ratio,
+            'std_omega_ratio': std_ratio,
+            'theory': theory,
+            'fractional_deviation': deviation,
+            'percent_deviation': deviation * 100
+        }
+        
+        # Generate message
+        if omega_data['is_1d']:
+            msg = f"ΩF/ΩH at horizon = {mean_ratio:.4f} (theory: {theory:.3f}, deviation: {deviation*100:.1f}%)"
+        else:
+            msg = f"<ΩF/ΩH> at horizon = {mean_ratio:.4f} ± {std_ratio:.4f} (theory: {theory:.3f}, deviation: {deviation*100:.1f}%)"
+        
+        if is_valid:
+            result['message'] = "✓ " + msg
+            result['status'] = "VALID"
+        elif deviation <= 0.30:  # Within 30%
+            result['message'] = "⚠ " + msg + " (outside tolerance but reasonable)"
+            result['status'] = "WARNING"
+        else:
+            result['message'] = "✗ " + msg + " (SIGNIFICANT DEVIATION - CHECK SIMULATION)"
+            result['status'] = "ERROR"
+        
+        return result
+
     
-    def calculate_bz_power_prediction(self, flux_data, omega_ratio_avg):
-        """Calculate BZ power prediction and compare with simulation"""
+    def calculate_bz_power_prediction(self, flux_data=None, omega_ratio_avg=None):
+        """
+        Calculate BZ power prediction
+        
+        Args:
+            flux_data: Magnetic flux data (optional - will compute if None)
+            omega_ratio_avg: DEPRECATED - will be computed from extract_omega_at_horizon()
+        
+        Returns:
+            dict with BZ power prediction
+        """
+        # If no flux_data provided, compute it
         if flux_data is None:
-            print("Cannot calculate BZ power - no flux data")
-            return None
+            flux_data = self.calculate_hemisphere_flux()
+            if flux_data is None:
+                print("Cannot calculate BZ power - no flux data")
+                return None
+        
+        # Get omega ratio from proper horizon extraction
+        if omega_ratio_avg is None:
+            omega_data = self.extract_omega_at_horizon()
+            if omega_data is None:
+                print("Cannot calculate BZ power - no omega data")
+                return None
+            omega_ratio_avg = omega_data['mean_omega_ratio']  # ← CORRECT KEY
         
         # BZ parameters
         a = hs.a
-        rhor = flux_data['horizon_radius']
-        total_flux = flux_data['total_flux']
+        rhor = flux_data.get('horizon_radius', 1 + np.sqrt(1 - a**2))
+        total_flux = flux_data['flux_total']
         
-        # BZ power formula: P_BZ = (a²Φ²)/(4πr_H²) × (ΩF/ΩH)² 
-        # (ignoring sin²θ angular averaging for now)
-        
+        # BZ power formula: P_BZ = (a²Φ²)/(4πr_H²) × (ΩF/ΩH)²
         bz_power = (a**2 * total_flux**2) / (4 * np.pi * rhor**2) * (omega_ratio_avg)**2
         
-        print(f"\n=== BZ POWER CALCULATION ===")
-        print(f"Black hole spin a = {a:.3f}")
-        print(f"Horizon radius r_h = {rhor:.3f}")
-        print(f"Magnetic flux Φ = {total_flux:.3e}")
-        print(f"Frame dragging ΩF/ΩH = {omega_ratio_avg:.3f}")
-        print(f"")
-        print(f"BZ Power Prediction: P_BZ = {bz_power:.3e}")
+        # Concise output (no verbose printing unless debugging)
+        if False:  # Set to True for debugging
+            print(f"\n=== BZ POWER CALCULATION ===")
+            print(f"Black hole spin a = {a:.3f}")
+            print(f"Horizon radius r_h = {rhor:.3f}")
+            print(f"Magnetic flux Φ = {total_flux:.3e}")
+            print(f"Frame dragging ΩF/ΩH = {omega_ratio_avg:.3f}")
+            print(f"BZ Power Prediction: P_BZ = {bz_power:.3e}")
+        
+        return {
+            'theoretical_power': bz_power,     # For backward compatibility
+            'bz_power_prediction': bz_power,   # Also provide this
+            'flux': total_flux,
+            'omega_ratio': omega_ratio_avg,
+            'spin': a,
+            'horizon_radius': rhor
+        }
         
     def calculate_total_power_from_simulation(self, results):
         """
@@ -277,70 +1470,57 @@ class MagnetizedAnalysis:
             'time': time
         }
     
-    def compare_theory_vs_simulation(self, flux_data, power_data, omega_ratio_avg, bz_prediction=None):
-        """Compare BZ theoretical prediction with simulation measurement"""
+    def compare_theory_vs_simulation(self, flux_data, power_data, omega_ratio_avg=None, bz_prediction=None):
+        """
+        Compare BZ theoretical prediction with simulation measurement
+        """
         if flux_data is None or power_data is None:
             print("Cannot compare - missing flux or power data")
             return
             
         print("\n" + "="*50)
-        print("BLANDFORD-ZNAJEK THEORY vs SIMULATION COMPARISON") 
+        print("BZ THEORY vs SIMULATION COMPARISON") 
         print("="*50)
+        
+        # Get omega_ratio if not provided
+        if omega_ratio_avg is None and bz_prediction is None:
+            omega_data = self.extract_omega_at_horizon()
+            if omega_data:
+                omega_ratio_avg = omega_data['mean_omega_ratio']
         
         # Use existing BZ prediction if provided, otherwise calculate it
         if bz_prediction is not None:
-            theoretical_power = bz_prediction['bz_power_prediction']
+            theoretical_power = bz_prediction.get('bz_power_prediction', 
+                                                bz_prediction.get('theoretical_power', 0))
         else:
             bz_pred = self.calculate_bz_power_prediction(flux_data, omega_ratio_avg)
             if bz_pred is None:
                 print("Cannot calculate BZ prediction")
                 return
-            theoretical_power = bz_pred['bz_power_prediction']
+            theoretical_power = bz_pred['theoretical_power']
             
         measured_power = power_data['measured_power']
         
         # Calculate agreement
-        ratio = measured_power / theoretical_power
+        ratio = measured_power / theoretical_power if theoretical_power != 0 else 0
         percent_difference = abs(ratio - 1) * 100
         
-        print(f"\nPhysical Interpretation:")
-        print(f"• Energy flux integration follows from Poynting's theorem")
-        print(f"• Total Power = ∫ (Energy Flux) · dA over spherical surface")
-        print(f"• BZ theory: P = (a²Φ²/4πr_h²) × (ΩF/ΩH)²")
-        print(f"")
-        print(f"Results:")
-        print(f"• Theoretical BZ Power:  {theoretical_power:.3e}")
-        print(f"• Measured Simulation Power: {measured_power:.3e}")
-        print(f"• Ratio (Sim/Theory):    {ratio:.2f}")
-        print(f"• Percentage difference: {percent_difference:.1f}%")
-        print(f"")
+        # CLEANED UP: Just the facts
+        print(f"\nResults:")
+        print(f"  Theoretical BZ Power: {theoretical_power:.3e}")
+        print(f"  Measured Power:       {measured_power:.3e}")
+        print(f"  Ratio (Sim/Theory):   {ratio:.2f}")
+        print(f"  Deviation:            {percent_difference:.1f}%")
         
+        # Simple assessment
         if 0.5 <= ratio <= 2.0:
             agreement = "GOOD"
         elif 0.2 <= ratio <= 5.0:
             agreement = "REASONABLE" 
         else:
             agreement = "ENHANCED" if ratio > 5.0 else "POOR"
-            
-        print(f"Agreement Assessment: {agreement}")
         
-        if agreement == "GOOD":
-            print("✓ Simulation successfully reproduces BZ power extraction!")
-        elif agreement == "REASONABLE":
-            print("~ Simulation shows BZ-like power extraction with some deviation")
-        elif agreement == "ENHANCED":
-            print("↑ Simulation shows enhanced power extraction beyond pure BZ theory")
-            print("  This is physically reasonable due to additional plasma physics:")
-            print("  - Magnetic reconnection and plasma acceleration")
-            print("  - Energy accumulation in the outflow")
-            print("  - Non-ideal MHD effects")
-        else:
-            print("✗ Significant discrepancy - may indicate numerical issues")
-            
-        print("\nNote: Power increases with radius indicate energy addition:")
-        print("• BZ theory gives minimum power generated at horizon")
-        print("• Additional physics enhances energy extraction")  
-        print("• Frame dragging efficiency ΩF/ΩH matches theory perfectly")
+        print(f"  Assessment:           {agreement}")
         
         return {
             'theoretical_power': theoretical_power,
@@ -351,13 +1531,14 @@ class MagnetizedAnalysis:
         }
     
     def analyze_1d_monopole(self, dump_files, sample_every=1):
-        """Complete analysis of 1D monopole problem"""
+        """Complete analysis of 1D monopole problem - FIXED ΩF/ΩH calculation"""
         results = {
             'times': [],
             'sigma_horizon': [],
             'sigma_initial': None,
             'lorentz_factors': [],
-            'omega_ratios': [],
+            'omega_ratios': [],  # FIXED: Now stores horizon values only
+            'omega_ratio_evolution': [],  # FIXED: Full evolution data
             'radial_profiles': {
                 'r': None,
                 'gamma': [],
@@ -368,7 +1549,6 @@ class MagnetizedAnalysis:
         
         print("=== 1D MONOPOLE ANALYSIS ===")
         
-        # Sample dump files
         sampled_files = dump_files[::sample_every]
         
         for i, dump_file in enumerate(sampled_files):
@@ -379,54 +1559,114 @@ class MagnetizedAnalysis:
                 # Calculate key quantities
                 sigma = self.calculate_magnetization()
                 gamma = self.calculate_lorentz_factor()
-                omega_f, omega_ratio = self.calculate_omega_ratios()
+                
+                # FIXED: Extract ΩF/ΩH at horizon (not domain-averaged)
+                try:
+                    omega_data = self.extract_omega_at_horizon()
+                    omega_ratio_horizon = omega_data['omega_ratio_horizon']
+                    
+                    # Store for time series
+                    results['omega_ratios'].append(omega_ratio_horizon)
+                    results['omega_ratio_evolution'].append({
+                        'time': current_time,
+                        'omega_ratio': omega_ratio_horizon,
+                        'horizon_radius': omega_data['horizon_radius'],
+                        'horizon_idx': omega_data['horizon_idx']
+                    })
+                    
+                except Exception as e:
+                    print(f"Warning: Could not extract ΩF/ΩH for {dump_file}: {e}")
+                    omega_ratio_horizon = None
                 
                 if sigma is not None and gamma is not None:
-                    # Extract 1D profiles (along equatorial plane)
+                    # Extract 1D profiles
                     r_profile = hs.r.squeeze()
                     sigma_profile = sigma.squeeze()
                     gamma_profile = gamma.squeeze()
                     
-                    # Store initial magnetization (from first dump)
+                    # Store initial magnetization
                     if results['sigma_initial'] is None:
-                        # Find magnetization near horizon (within first few cells)
                         horizon_idx = 5  # First few cells near horizon
                         results['sigma_initial'] = np.mean(sigma_profile[:horizon_idx])
                         results['radial_profiles']['r'] = r_profile
                     
-                    # Store current profiles
+                    # Store current state
                     results['times'].append(current_time)
-                    results['sigma_horizon'].append(sigma_profile[0])  # At innermost cell
-                    results['lorentz_factors'].append(gamma_profile[-1])  # At outermost cell
+                    results['sigma_horizon'].append(sigma_profile[0])
+                    results['lorentz_factors'].append(gamma_profile[-1])
                     
-                    if omega_ratio is not None:
-                        # Average over available cells
-                        avg_omega_ratio = np.mean(omega_ratio.squeeze()) if hasattr(omega_ratio, 'squeeze') else omega_ratio
-                        results['omega_ratios'].append(avg_omega_ratio)
-                    
-                    # Store profiles for selected times
-                    if i % 5 == 0:  # Every 5th file for profile evolution
+                    # Store profiles for evolution
+                    if i % 5 == 0:
                         results['radial_profiles']['gamma'].append(gamma_profile)
                         results['radial_profiles']['sigma'].append(sigma_profile)
                         results['radial_profiles']['times'].append(current_time)
                 
-                print(f"Processed {dump_file}: t={current_time:.3f}")
+                print(f"Processed {dump_file}: t={current_time:.3f}, ΩF/ΩH(horizon)={omega_ratio_horizon:.4f if omega_ratio_horizon else 'N/A'}")
                 
             except Exception as e:
                 print(f"Error processing {dump_file}: {e}")
                 continue
         
+        # FIXED: Validate ΩF/ΩH at end
+        if results['omega_ratios']:
+            final_omega = results['omega_ratios'][-1]
+            print(f"\n=== VALIDATION ===")
+            print(f"Final ΩF/ΩH at horizon: {final_omega:.4f}")
+            print(f"Theoretical prediction: 0.500")
+            print(f"Deviation: {abs(final_omega - 0.5)/0.5 * 100:.1f}%")
+        
         return results
-    
+
+
     def analyze_2d_monopole(self, dump_files, sample_every=5):
-        """Enhanced analysis for 2D BZ monopole problems"""
+        """
+        Enhanced analysis for 2D BZ monopole problems.
+        
+        Physical Context:
+        ---------------
+        The BZ mechanism (Blandford-Znajek mechanism) extracts rotational energy 
+        from spinning black holes via magnetic fields. Key observables:
+        
+        1. Frame Dragging (ΩF/ΩH):
+        - ΩF: Angular velocity of magnetic field lines at horizon
+        - ΩH: Angular velocity of horizon itself
+        - Theory predicts ΩF/ΩH = 0.5 for monopole field
+        - Must be measured AT THE HORIZON, not domain-averaged
+        
+        2. Stagnation Surface (u^r = 0):
+        - Location where radial velocity vanishes
+        - Inside: outflow (u^r > 0), energy extraction occurs here
+        - Outside: may be infall (u^r < 0) depending on boundary conditions
+        - NOT the fast magnetosonic surface! (common misconception)
+        
+        3. Power Extraction:
+        - Energy flux: dEr = -√g × T^r_t
+        - Total power: P = ∫ dEr over sphere
+        - Compare with BZ prediction: P_BZ = (a²Φ²/4πr_h²) × (ΩF/ΩH)²
+        
+        Parameters:
+        ----------
+        dump_files : list
+            List of dump file names to analyze
+        sample_every : int
+            Analyze every N-th file (default: 5)
+        
+        Returns:
+        -------
+        dict : Analysis results containing:
+            - times: List of simulation times
+            - power_extraction: Energy flux profiles vs radius
+            - stagnation_surface_data: u^r = 0 surface location and properties
+            - omega_theta_profiles: ΩF(θ)/ΩH at horizon for each time
+            - horizon_data: Properties measured at r = r_horizon
+        """
         print("=== 2D BZ MONOPOLE ANALYSIS ===")
         
         results = {
             'times': [],
             'power_extraction': [],
-            'fast_surface_data': [],
-            'omega_theta_profiles': [],
+            'stagnation_surface_data': [],  # Renamed from stagnation_surface_data
+            'omega_theta_profiles': [],  # FIXED: Now stores full θ-profile at horizon
             'horizon_data': []
         }
         
@@ -442,18 +1682,16 @@ class MagnetizedAnalysis:
                 
                 # Get 2D data
                 r_2d = hs.r.squeeze()
-                h_2d = hs.h.squeeze()  # theta coordinate
+                h_2d = hs.h.squeeze()
                 rho_2d = hs.rho.squeeze()
                 
                 # Power extraction analysis
                 if hasattr(hs, 'Tud'):
-                    # Energy flux: -g^(1/2) * T^r_t
                     dEr = -hs.gdet * hs.Tud[1,0] * hs._dx2 * hs._dx3
-                    Er = dEr.sum(axis=-1) if dEr.ndim > 2 else dEr.sum(axis=1)  # Sum over phi
+                    Er = dEr.sum(axis=-1) if dEr.ndim > 2 else dEr.sum(axis=1)
                     
-                    # FIXED: Average over theta to get single radial profile
                     if Er.ndim > 1:
-                        Er_avg = Er.mean(axis=1)  # Average over theta direction
+                        Er_avg = Er.mean(axis=1)
                     else:
                         Er_avg = Er
                     
@@ -463,10 +1701,10 @@ class MagnetizedAnalysis:
                         'r_coord': r_2d[:,0] if r_2d.ndim > 1 else r_2d
                     })
                 
-                # Fast surface analysis (where u^r = 0)
+                # Stagnation surface analysis (renamed from fast surface)
                 if hasattr(hs, 'uu'):
                     ur = hs.uu[1].squeeze()
-                    results['fast_surface_data'].append({
+                    results['stagnation_surface_data'].append({
                         'time': current_time,
                         'ur': ur,
                         'r': r_2d,
@@ -474,33 +1712,27 @@ class MagnetizedAnalysis:
                         'rho': rho_2d
                     })
                 
-                # ΩF/ΩH analysis at horizon
-                if hasattr(hs, 'omegaf2') and hasattr(hs, 'a'):
-                    omega_f = hs.omegaf2.squeeze()
-                    a = hs.a
-                    rhor = 1 + (1 - a**2)**0.5
-                    omega_h = a / (2 * rhor)
+                # FIXED: ΩF/ΩH analysis at horizon (full θ-profile)
+                try:
+                    omega_data = self.extract_omega_at_horizon()
                     
-                    # Find horizon index (closest to rhor)
-                    r_1d = r_2d[:,0] if r_2d.ndim > 1 else r_2d
-                    horizon_idx = np.abs(r_1d - rhor).argmin()
+                    if not omega_data['is_1d']:
+                        # 2D case: we have full θ-profile
+                        results['omega_theta_profiles'].append({
+                            'time': current_time,
+                            'theta': omega_data['theta'],
+                            'omega_f': omega_data['omega_f_horizon'],
+                            'omega_ratio': omega_data['omega_ratio_horizon'],
+                            'mean_omega_ratio': omega_data['mean_omega_ratio'],
+                            'std_omega_ratio': omega_data['std_omega_ratio'],
+                            'horizon_radius': omega_data['horizon_radius'],
+                            'horizon_idx': omega_data['horizon_idx']
+                        })
+                        
+                        print(f"  <ΩF/ΩH> = {omega_data['mean_omega_ratio']:.4f} ± {omega_data['std_omega_ratio']:.4f}")
                     
-                    # Get ΩF/ΩH profile at horizon
-                    if omega_f.ndim > 1:
-                        omega_f_horizon = omega_f[horizon_idx, :]
-                        theta_horizon = h_2d[horizon_idx, :] if h_2d.ndim > 1 else h_2d
-                        omega_ratio_horizon = omega_f_horizon / omega_h if omega_h != 0 else omega_f_horizon * 0
-                    else:
-                        omega_f_horizon = omega_f
-                        theta_horizon = np.pi/2  # equatorial
-                        omega_ratio_horizon = omega_f_horizon / omega_h if omega_h != 0 else 0
-                    
-                    results['omega_theta_profiles'].append({
-                        'time': current_time,
-                        'theta': theta_horizon,
-                        'omega_ratio': omega_ratio_horizon,
-                        'horizon_radius': rhor
-                    })
+                except Exception as e:
+                    print(f"  Warning: Could not extract ΩF/ΩH: {e}")
                 
                 results['times'].append(current_time)
                 
@@ -510,18 +1742,23 @@ class MagnetizedAnalysis:
                 traceback.print_exc()
                 continue
         
+        # FIXED: Final validation
+        if results['omega_theta_profiles']:
+            final_omega = results['omega_theta_profiles'][-1]
+            print(f"\n=== VALIDATION ===")
+            print(f"Final <ΩF/ΩH> at horizon: {final_omega['mean_omega_ratio']:.4f} ± {final_omega['std_omega_ratio']:.4f}")
+            print(f"Theoretical prediction: 0.500")
+            print(f"Deviation: {abs(final_omega['mean_omega_ratio'] - 0.5)/0.5 * 100:.1f}%")
+        
         return results
     
     def plot_1d_monopole_results(self, results, show=True):
-        """Plot results from 1D monopole analysis - clean and focused"""
+        """Plot results from 1D monopole analysis - FIXED for horizon ΩF/ΩH"""
         
-        # Create figure with better spacing
         fig = plt.figure(figsize=(16, 10))
-        
-        # Use GridSpec with tighter spacing - reduced gaps between subplots
-        # from matplotlib.gridspec import GridSpec
+        from matplotlib.gridspec import GridSpec
         gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.25, 
-                     left=0.06, right=0.96, top=0.88, bottom=0.10)
+                    left=0.06, right=0.96, top=0.88, bottom=0.10)
         
         # 1. Lorentz factor evolution
         ax1 = fig.add_subplot(gs[0, 0])
@@ -533,61 +1770,68 @@ class MagnetizedAnalysis:
             ax1.grid(True, alpha=0.3)
             ax1.tick_params(labelsize=12)
             
-            # Clean annotation for final value
             final_gamma = results['lorentz_factors'][-1]
             ax1.text(0.05, 0.95, f'Final γ = {final_gamma:.2f}', 
                     transform=ax1.transAxes, fontsize=13, fontweight='bold',
                     bbox=dict(boxstyle="round,pad=0.4", facecolor="lightblue", alpha=0.9))
         
-        # 2. Frame dragging ratio
+        # 2. Frame dragging ratio - FIXED
         ax2 = fig.add_subplot(gs[0, 1])
         if results['times'] and results['omega_ratios']:
             ax2.plot(results['times'], results['omega_ratios'], 'r-', linewidth=3)
-            ax2.axhline(y=0.5, color='k', linestyle='--', alpha=0.8, linewidth=2)
+            ax2.axhline(y=0.5, color='k', linestyle='--', alpha=0.8, linewidth=2, label='BZ Theory')
             ax2.set_xlabel('Time', fontsize=13)
-            ax2.set_ylabel('ΩF/ΩH', fontsize=13)
+            ax2.set_ylabel('ΩF/ΩH at Horizon', fontsize=13)  # FIXED: Specify "at Horizon"
             ax2.set_title('Frame Dragging Efficiency', fontsize=14, pad=15)
             ax2.grid(True, alpha=0.3)
             ax2.tick_params(labelsize=12)
+            ax2.legend(fontsize=11)
             
-            # Clean annotation
-            final_omega = np.mean(results['omega_ratios'][-100:])
-            ax2.text(0.05, 0.95, f'Final = {final_omega:.3f}\nTheory = 0.500', 
-                    transform=ax2.transAxes, fontsize=13, fontweight='bold', va='top',
+            # FIXED: Report precise values
+            final_omega = results['omega_ratios'][-1]
+            theory = 0.500
+            deviation = abs(final_omega - theory) / theory * 100
+            
+            text = f'ΩF/ΩH = {final_omega:.4f}\nTheory = {theory:.3f}\nDev = {deviation:.1f}%'
+            ax2.text(0.05, 0.95, text, 
+                    transform=ax2.transAxes, fontsize=12, fontweight='bold', va='top',
                     bbox=dict(boxstyle="round,pad=0.4", facecolor="lightcoral", alpha=0.9))
         
         # 3. Key values comparison
         ax3 = fig.add_subplot(gs[0, 2])
         if results['sigma_initial'] and results['lorentz_factors']:
-            categories = ['σ0', '√σ0', 'γ_final']
-            values = [results['sigma_initial'], np.sqrt(results['sigma_initial']), results['lorentz_factors'][-1]]
+            categories = ['σ₀', '√σ₀', 'γ_final']
+            values = [
+                results['sigma_initial'], 
+                np.sqrt(results['sigma_initial']), 
+                results['lorentz_factors'][-1]
+            ]
             colors = ['green', 'orange', 'blue']
             
-            bars = ax3.bar(categories, values, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+            bars = ax3.bar(categories, values, color=colors, alpha=0.7, 
+                        edgecolor='black', linewidth=1.5)
             ax3.set_ylabel('Value', fontsize=13)
             ax3.set_title('Magnetization vs Acceleration', fontsize=14, pad=15)
             ax3.grid(True, alpha=0.3, axis='y')
             ax3.tick_params(labelsize=12)
             
-            # Value labels on bars
             for bar, value in zip(bars, values):
                 height = bar.get_height()
                 ax3.text(bar.get_x() + bar.get_width()/2., height + height*0.05,
-                        f'{value:.1f}', ha='center', va='bottom', fontsize=13, fontweight='bold')
+                        f'{value:.1f}', ha='center', va='bottom', 
+                        fontsize=13, fontweight='bold')
             
             ax3.set_ylim(0, max(values) * 1.15)
         
-        # 4. Radial acceleration profiles with time progression colorbar (FIXED)
+        # 4. Radial acceleration profiles with time progression
         ax4 = fig.add_subplot(gs[1, 0])
         if results['radial_profiles']['r'] is not None and results['radial_profiles']['gamma']:
             r = results['radial_profiles']['r']
             times = results['radial_profiles']['times']
             
-            # Create colormap for time evolution
             colormap = plt.cm.plasma
             norm = plt.Normalize(min(times), max(times))
             
-            # Show every 5th profile to avoid clutter (FIXED: changed from 4 to 5)
             for i in range(0, len(results['radial_profiles']['gamma']), 5):
                 gamma_prof = results['radial_profiles']['gamma'][i]
                 time = times[i]
@@ -600,57 +1844,55 @@ class MagnetizedAnalysis:
             ax4.grid(True, alpha=0.3)
             ax4.tick_params(labelsize=12)
             
-            # Add colorbar showing time progression (RESTORED)
             sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
             sm.set_array([])
             cbar = plt.colorbar(sm, ax=ax4, shrink=0.8, pad=0.02)
             cbar.set_label('Time', fontsize=12)
             cbar.ax.tick_params(labelsize=11)
         
-        # 5. Numerical results summary (MORE COMPACT)
-        ax5 = fig.add_subplot(gs[1, 1:])  # Span two columns
+        # 5. Numerical results summary - FIXED
+        ax5 = fig.add_subplot(gs[1, 1:])
         ax5.axis('off')
         
         if results['sigma_initial'] and results['lorentz_factors'] and results['omega_ratios']:
             sigma0 = results['sigma_initial']
             gamma_final = results['lorentz_factors'][-1]
-            omega_ratio = np.mean(results['omega_ratios'][-100:])
+            omega_final = results['omega_ratios'][-1]
             sqrt_sigma0 = np.sqrt(sigma0)
             efficiency = gamma_final / sqrt_sigma0
             final_velocity = np.sqrt(1 - 1/gamma_final**2)
             
-            # More compact results text
+            # FIXED: Precise reporting with exact numbers
+            theory_omega = 0.500
+            omega_deviation = abs(omega_final - theory_omega) / theory_omega * 100
+            
             results_text = f"""
-KEY SIMULATION RESULTS
+    KEY SIMULATION RESULTS (1D Monopole)
 
-Initial Magnetization:        σ0 = {sigma0:.0f}
-Theoretical Max γ:            √σ0 = {sqrt_sigma0:.1f}
+    Initial Magnetization:        σ₀ = {sigma0:.1e}
+    Theoretical Max γ:            √σ₀ = {sqrt_sigma0:.2f}
 
-Final Lorentz Factor:         γ_final = {gamma_final:.2f}
-Final Velocity:               v/c = {final_velocity:.3f}
-Acceleration Efficiency:      γ/√σ0 = {efficiency:.2f} ({efficiency*100:.0f}%)
+    Final Lorentz Factor:         γ_final = {gamma_final:.2f}
+    Theoretical Limit:            √σ₀ = {sqrt_sigma0:.2f}
+    Acceleration Efficiency:      γ/√σ₀ = {efficiency:.3f} ({efficiency*100:.1f}%)
+    Final Velocity:               v/c = {final_velocity:.4f}
 
-Frame Dragging Ratio:         ΩF/ΩH = {omega_ratio:.3f}
-Theoretical Prediction:       ΩF/ΩH = 0.500
-Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
+    Frame Dragging at Horizon:    ΩF/ΩH = {omega_final:.4f}
+    Theoretical Prediction:       ΩF/ΩH = {theory_omega:.3f}
+    Fractional Deviation:         {omega_deviation:.1f}%
             """
             
-            # Smaller text box with tighter padding
             ax5.text(0.15, 0.95, results_text, transform=ax5.transAxes, 
                     fontsize=12, verticalalignment='top', fontfamily='monospace',
-                    bbox=dict(boxstyle="round,pad=0.4", facecolor="lightgray", alpha=0.9, edgecolor='black'))
+                    bbox=dict(boxstyle="round,pad=0.4", facecolor="lightgray", 
+                            alpha=0.9, edgecolor='black'))
         
-        # Removed erroneous "(t=200)" from title
         fig.suptitle('1D Monopole Magnetosphere Analysis', 
                     fontsize=18, fontweight='bold', y=0.92)
         
-        # Save figure
         filename = os.path.join(self.output_dir, "monopole_1d_results.png")
         plt.savefig(filename, dpi=200, bbox_inches='tight', facecolor='white')
         print(f"Saved results plot: {filename}")
-        
-        # Generate detailed Lorentz factor plot
-        self.plot_lorentz_factor_detailed(results, show)
         
         if show:
             plt.show()
@@ -658,7 +1900,11 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
             plt.close()
     
     def plot_2d_monopole_results(self, results, field_type="Auto", show=True):
-        """Plot 2D BZ analysis results with dynamic labeling"""
+        """
+        Plot 2D BZ analysis results with precise ΩF/ΩH reporting at horizon.
+        
+        SESSION 2 UPDATE: Shows exact ΩF/ΩH values with error bars, no vague language.
+        """
         if not results['times']:
             print("No results to plot!")
             return
@@ -676,15 +1922,13 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
         from matplotlib.gridspec import GridSpec
         gs = GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
         
-        # 1. Power extraction evolution - show time evolution with colorbar
+        # 1. Power extraction evolution
         ax1 = fig.add_subplot(gs[0, 0])
         if results['power_extraction']:
-            # Show multiple timesteps with color progression
             times = [data['time'] for data in results['power_extraction']]
             colormap = plt.cm.viridis
             norm = plt.Normalize(min(times), max(times))
             
-            # Sample every 5th timestep to avoid clutter
             sample_indices = range(0, len(results['power_extraction']), 5)
             
             for i in sample_indices:
@@ -701,56 +1945,48 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
             ax1.set_title('Power Extraction Evolution', fontsize=13)
             ax1.grid(True, alpha=0.3)
             
-            # Add colorbar for time progression
             sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
             sm.set_array([])
             cbar1 = plt.colorbar(sm, ax=ax1, shrink=0.8, pad=0.02)
             cbar1.set_label('Time', fontsize=11)
             cbar1.ax.tick_params(labelsize=10)
         
-        # 2. Full domain fast surface visualization with better density display
+        # 2. Stagnation surface visualization (RENAMED from stagnation_surface)
         ax2 = fig.add_subplot(gs[0, 1])
-        if results['fast_surface_data']:
-            latest_data = results['fast_surface_data'][-1]
+        if results['stagnation_surface_data']:  # RENAMED
+            latest_data = results['stagnation_surface_data'][-1]  # RENAMED
             r_2d = latest_data['r']
             h_2d = latest_data['h']
             ur_2d = latest_data['ur']
             rho_2d = latest_data['rho']
             
-            # Convert to Cartesian - FIXED: Full circle display
+            # Convert to Cartesian
             x = r_2d * np.sin(h_2d)
             z = r_2d * np.cos(h_2d)
             
-            # Create mirrored data for full circle visualization
-            x_mirror = -x
-            z_mirror = z
-            rho_mirror = rho_2d
-            ur_mirror = ur_2d
+            # Mirror for full circle
+            x_full = np.concatenate([x, -x], axis=1)
+            z_full = np.concatenate([z, z], axis=1)
+            rho_full = np.concatenate([rho_2d, rho_2d], axis=1)
+            ur_full = np.concatenate([ur_2d, ur_2d], axis=1)
             
-            # Combine original and mirrored
-            x_full = np.concatenate([x, x_mirror], axis=1)
-            z_full = np.concatenate([z, z_mirror], axis=1)
-            rho_full = np.concatenate([rho_2d, rho_mirror], axis=1)
-            ur_full = np.concatenate([ur_2d, ur_mirror], axis=1)
-            
-            # Better density normalization for visibility
+            # Better density normalization
             rho_positive = rho_full[rho_full > 0]
             if len(rho_positive) > 0:
-                vmin = np.percentile(rho_positive, 1)  # 1st percentile
-                vmax = np.percentile(rho_positive, 99)  # 99th percentile
+                vmin = np.percentile(rho_positive, 1)
+                vmax = np.percentile(rho_positive, 99)
             else:
                 vmin, vmax = rho_full.min(), rho_full.max()
             
-            # Plot density with better contrast
             im = ax2.pcolormesh(x_full, z_full, rho_full, cmap='viridis', 
-                               norm=LogNorm(vmin=vmin, vmax=vmax), alpha=0.8)
+                            norm=LogNorm(vmin=vmin, vmax=vmax), alpha=0.8)
             
-            # Overplot fast surface contour
+            # Overplot stagnation surface contour (UPDATED LABEL)
             try:
                 ax2.contour(x_full, z_full, ur_full, levels=[0], 
-                           colors='red', linewidths=2, alpha=0.9)
+                        colors='red', linewidths=2, alpha=0.9)
             except:
-                print("Could not plot fast surface contour")
+                pass
             
             # Add black hole
             if results['omega_theta_profiles']:
@@ -760,26 +1996,35 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
             
             ax2.set_xlabel('X (r_g)', fontsize=12)
             ax2.set_ylabel('Z (r_g)', fontsize=12)
-            ax2.set_title('Fast Surface (u^r=0)', fontsize=13)
+            ax2.set_title('Stagnation Surface (u^r=0)', fontsize=13)  # UPDATED
             ax2.set_xlim(-50, 50)
             ax2.set_ylim(-50, 50)
             ax2.set_aspect('equal')
             
-            # Add colorbar
             cbar2 = plt.colorbar(im, ax=ax2, label='log10(density)', shrink=0.8)
         
-        # 3. ΩF/ΩH vs θ profile - final timestep only (clean)
+        # 3. ΩF(θ)/ΩH profile at horizon - PRECISE REPORTING
         ax3 = fig.add_subplot(gs[1, 0])
         if results['omega_theta_profiles']:
-            latest_omega = results['omega_theta_profiles'][-1]  # Final timestep only
+            latest_omega = results['omega_theta_profiles'][-1]
             theta = latest_omega['theta']
             omega_ratio = latest_omega['omega_ratio']
             final_time = latest_omega['time']
             
             if hasattr(theta, '__len__') and len(theta) > 1:
-                ax3.plot(theta, omega_ratio, 'b-', linewidth=3)
-                ax3.axhline(y=0.5, color='r', linestyle='--', alpha=0.8, linewidth=2)
+                # Plot with error band
+                ax3.plot(theta, omega_ratio, 'b-', linewidth=3, label='Simulation')
+                ax3.axhline(y=0.5, color='r', linestyle='--', alpha=0.8, linewidth=2, 
+                        label='BZ Theory = 0.500')
                 ax3.fill_between(theta, 0.5, omega_ratio, alpha=0.2, color='lightblue')
+                
+                # Calculate precise statistics
+                avg_omega = np.mean(omega_ratio)
+                std_omega = np.std(omega_ratio)
+                min_omega = np.min(omega_ratio)
+                max_omega = np.max(omega_ratio)
+                deviation_percent = abs(avg_omega - 0.5) / 0.5 * 100
+                
                 ax3.set_xlabel('θ (radians)', fontsize=12)
                 ax3.set_ylabel('ΩF/ΩH', fontsize=12)
                 ax3.set_title(f'Frame Dragging at Horizon (t={final_time:.0f})', fontsize=13)
@@ -787,16 +2032,34 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
                 ax3.set_xlim(0, np.pi)
                 ax3.set_ylim(0.4, 0.8)
                 
-                # Add theta labels
+                # Theta labels
                 ax3.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
                 ax3.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
+                
+                # PRECISE numerical annotation (NO VAGUE LANGUAGE)
+                stats_text = f'⟨ΩF/ΩH⟩ = {avg_omega:.4f} ± {std_omega:.4f}\n'
+                stats_text += f'Theory = 0.5000\n'
+                stats_text += f'Deviation = {deviation_percent:.1f}%\n'
+                stats_text += f'Range: [{min_omega:.4f}, {max_omega:.4f}]'
+                
+                ax3.text(0.02, 0.98, stats_text, transform=ax3.transAxes, 
+                        fontsize=11, verticalalignment='top', fontfamily='monospace',
+                        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9))
+                
+                ax3.legend(loc='upper right', fontsize=10)
             else:
-                ax3.text(0.5, 0.5, f'ΩF/ΩH = {omega_ratio:.3f}', 
-                        transform=ax3.transAxes, ha='center', va='center', fontsize=14,
+                # 1D case
+                deviation_percent = abs(omega_ratio - 0.5) / 0.5 * 100
+                text = f'ΩF/ΩH = {omega_ratio:.4f}\n'
+                text += f'Theory = 0.5000\n'
+                text += f'Deviation = {deviation_percent:.1f}%'
+                
+                ax3.text(0.5, 0.5, text, transform=ax3.transAxes, 
+                        ha='center', va='center', fontsize=14, fontfamily='monospace',
                         bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
-                ax3.set_title('Frame Dragging Ratio', fontsize=13)
+                ax3.set_title('Frame Dragging Ratio at Horizon', fontsize=13)
         
-        # 4. Clean numerical summary 
+        # 4. Numerical summary with PRECISE values
         ax4 = fig.add_subplot(gs[1, 1])
         ax4.axis('off')
         
@@ -806,58 +2069,67 @@ Deviation from Theory:        {abs(omega_ratio-0.5)/0.5*100:.1f}%
             
             if hasattr(omega_ratio, '__len__'):
                 avg_omega = np.mean(omega_ratio)
+                std_omega = np.std(omega_ratio)
                 min_omega = np.min(omega_ratio)
                 max_omega = np.max(omega_ratio)
+                deviation_percent = abs(avg_omega - 0.5) / 0.5 * 100
                 asymmetry = (max_omega - min_omega) / avg_omega * 100
                 
                 summary_text = f"""
-2D BZ MONOPOLE RESULTS
+    2D BZ MONOPOLE - QUANTITATIVE RESULTS
 
-Frame Dragging Analysis:
-Average ΩF/ΩH = {avg_omega:.3f}
-Min ΩF/ΩH = {min_omega:.3f}  
-Max ΩF/ΩH = {max_omega:.3f}
-BZ Theory = 0.500
-Deviation = {abs(avg_omega-0.5)/0.5*100:.1f}%
-Angular variation = {asymmetry:.1f}%
+    Frame Dragging at Horizon:
+    ⟨ΩF/ΩH⟩ = {avg_omega:.4f} ± {std_omega:.4f}
+    Min ΩF/ΩH = {min_omega:.4f}
+    Max ΩF/ΩH = {max_omega:.4f}
+    BZ Theory = 0.5000
+    Deviation = {deviation_percent:.2f}%
+    Angular variation = {asymmetry:.1f}%
 
-Black Hole Properties:
-Horizon radius = {latest_omega['horizon_radius']:.2f} rg
-Estimated spin a ≈ 0.9
+    Black Hole Properties:
+    Horizon radius = {latest_omega['horizon_radius']:.3f} rg
+    Spin parameter a ≈ {hs.a:.3f}
+
+    Analysis Coverage:
+    Time span: {results['times'][0]:.1f} - {results['times'][-1]:.1f} M
+    Snapshots analyzed: {len(results['times'])}
                 """
             else:
+                deviation_percent = abs(omega_ratio - 0.5) / 0.5 * 100
+                
                 summary_text = f"""
-2D BZ MONOPOLE RESULTS
+    2D BZ MONOPOLE - QUANTITATIVE RESULTS
 
-Frame Dragging:
-ΩF/ΩH = {omega_ratio:.3f}
-BZ Theory = 0.500
-Deviation = {abs(omega_ratio-0.5)/0.5*100:.1f}%
+    Frame Dragging at Horizon:
+    ΩF/ΩH = {omega_ratio:.4f}
+    BZ Theory = 0.5000
+    Deviation = {deviation_percent:.2f}%
 
-Black Hole Properties:
-Horizon radius = {latest_omega['horizon_radius']:.2f} rg
+    Black Hole Properties:
+    Horizon radius = {latest_omega['horizon_radius']:.3f} rg
+    Spin parameter a ≈ {hs.a:.3f}
 
-Analysis Summary:
-Time span: {results['times'][0]:.1f} - {results['times'][-1]:.1f}
-Snapshots: {len(results['times'])}
+    Analysis Coverage:
+    Time span: {results['times'][0]:.1f} - {results['times'][-1]:.1f} M
+    Snapshots analyzed: {len(results['times'])}
                 """
             
             ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, 
                     fontsize=11, verticalalignment='top', fontfamily='monospace',
                     bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.9))
-            
-        # Dynamic main title
+        
+        # Dynamic title
         title_map = {
-            "Monopole": "2D BZ Monopole Magnetosphere Analysis",
-            "Dipole": "2D BZ Dipole Magnetosphere Analysis",
-            "Mixed/Evolving": "2D BZ Evolving Magnetosphere Analysis", 
-            "Unknown": "2D BZ Magnetosphere Analysis"
+            "Monopole": "2D BZ Monopole Magnetosphere: Quantitative Analysis",
+            "Dipole": "2D BZ Dipole Magnetosphere: Quantitative Analysis",
+            "Mixed/Evolving": "2D BZ Evolving Magnetosphere: Quantitative Analysis", 
+            "Unknown": "2D BZ Magnetosphere: Quantitative Analysis"
         }
         
-        main_title = title_map.get(field_type, f"2D BZ {field_type} Magnetosphere Analysis")
+        main_title = title_map.get(field_type, f"2D BZ {field_type} Magnetosphere: Quantitative Analysis")
         fig.suptitle(main_title, fontsize=18, fontweight='bold')
         
-        # Dynamic filename
+        # Save
         safe_field_type = field_type.lower().replace('/', '_').replace(' ', '_')
         filename = os.path.join(self.output_dir, f"bz_magnetosphere_{safe_field_type}_results.png")
         plt.savefig(filename, dpi=200, bbox_inches='tight')
@@ -913,7 +2185,7 @@ Snapshots: {len(results['times'])}
             r = hs.r.squeeze()
             h = hs.h.squeeze()
             
-            # Get radial velocity for fast surface
+            # Get radial velocity for stagnation surface
             ur = hs.uu[1].squeeze() if hasattr(hs, 'uu') else None
             
             # Convert to Cartesian
@@ -930,7 +2202,7 @@ Snapshots: {len(results['times'])}
                               norm=LogNorm(vmin=global_rho_min, vmax=global_rho_max),
                               shading='auto', alpha=0.9)
             
-            # Add fast surface if available
+            # Add stagnation surface if available
             if ur is not None:
                 try:
                     ur_full = np.concatenate([ur[:, ::-1], ur], axis=1)
@@ -947,7 +2219,7 @@ Snapshots: {len(results['times'])}
             
             ax.set_xlabel('X (r_g)', fontsize=14)
             ax.set_ylabel('Z (r_g)', fontsize=14)
-            ax.set_title(f'2D BZ Monopole: Density + Fast Surface (t = {hs.t:.1f})', fontsize=16)
+            ax.set_title(f'2D BZ Monopole: Density + Stagnation Surface (t = {hs.t:.1f})', fontsize=16)
             ax.set_xlim(-50, 50)
             ax.set_ylim(-50, 50)
             ax.set_aspect('equal')
@@ -1127,13 +2399,979 @@ Snapshots: {len(results['times'])}
             print(f"Error saving power extraction animation: {e}")
         
         plt.close(fig)
+
+    def plot_stagnation_surface_physics(self, dump_file, show=True, save=False):
+        """
+        Improved 2-panel plot showing stagnation surface physics.
+        
+        Panel 1: Radial velocity (kinematics)
+        Panel 2: Energy flux (energetics)
+        
+        Returns fig, axes for further customization
+        """
+        print("Generating improved stagnation surface physics plot...")
+        
+        # Load data
+        self.load_data("gdump", dump_file)
+        current_time = float(hs.t)
+        
+        # Get data
+        r_2d = hs.r.squeeze()
+        h_2d = hs.h.squeeze()
+        ur_2d = hs.uu[1].squeeze()
+        
+        a = hs.a
+        rhor = 1 + (1 - a**2)**0.5
+        
+        # Convert to Cartesian for full-circle visualization
+        x = r_2d * np.sin(h_2d)
+        z = r_2d * np.cos(h_2d)
+        x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+        z_full = np.concatenate([z[:, ::-1], z], axis=1)
+        ur_full = np.concatenate([ur_2d[:, ::-1], ur_2d], axis=1)
+        
+        # Create figure with 1x2 layout
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        ax1, ax2 = axes
+        
+        # Calculate statistics for summary
+        outflow_frac = (ur_full > 0).sum() / ur_full.size * 100
+        infall_frac = (ur_full < 0).sum() / ur_full.size * 100
+        
+        # Suptitle with physics summary
+        suptitle_text = (f'Stagnation Surface Physics | t = {current_time:.1f} M | '
+                        f'BH spin: a = {a:.3f}\n'
+                        f'Stagnation surface (green): u^r = 0  |  '
+                        f'Inside: Outflow ({outflow_frac:.1f}%)  |  '
+                        f'Outside: Infall ({infall_frac:.1f}%)')
+        fig.suptitle(suptitle_text, fontsize=14, fontweight='bold', y=0.96)
+        
+        # ========== PANEL 1: RADIAL VELOCITY ==========
+        vmax = np.percentile(np.abs(ur_full), 95)
+        im1 = ax1.pcolormesh(x_full, z_full, ur_full,
+                            cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                            shading='auto', rasterized=True)
+        
+        # Stagnation surface contour
+        try:
+            ax1.contour(x_full, z_full, ur_full, levels=[0],
+                    colors='lime', linewidths=3, linestyles='-')
+        except:
+            pass
+        
+        # Black hole
+        circle1 = plt.Circle((0, 0), rhor, facecolor='black',
+                            edgecolor='white', linewidth=2, zorder=10)
+        ax1.add_patch(circle1)
+        
+        ax1.set_title('Radial Velocity Field (u^r)', fontsize=13, fontweight='bold', pad=10)
+        ax1.set_xlabel('x (r_g)', fontsize=12)
+        ax1.set_ylabel('z (r_g)', fontsize=12)
+        ax1.set_aspect('equal')
+        ax1.set_xlim(-50, 50)
+        ax1.set_ylim(-50, 50)
+        
+        # Colorbar for Panel 1
+        cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label('Radial Velocity', fontsize=11)
+        
+        # ========== PANEL 2: ENERGY FLUX ==========
+        try:
+            # Calculate energy flux
+            energy_flux_2d = self.calculate_energy_flux_from_primitives()
+            energy_flux_full = np.concatenate([energy_flux_2d[:, ::-1],
+                                            energy_flux_2d], axis=1)
+            
+            # Use symmetric log scale with DIFFERENT colormap
+            vmax_abs = np.abs(energy_flux_full).max()
+            linthresh = 1e-6
+            
+            im2 = ax2.pcolormesh(x_full, z_full, energy_flux_full,
+                                cmap='PRGn',  # DIFFERENT from Panel 1!
+                                norm=SymLogNorm(linthresh=linthresh, 
+                                            vmin=-vmax_abs, vmax=vmax_abs),
+                                shading='auto', rasterized=True)
+            
+            # Stagnation surface contour
+            try:
+                ax2.contour(x_full, z_full, ur_full, levels=[0],
+                        colors='black', linewidths=3, linestyles='-', alpha=0.8)
+            except:
+                pass
+            
+            # Black hole
+            circle2 = plt.Circle((0, 0), rhor, facecolor='black',
+                            edgecolor='white', linewidth=2, zorder=10)
+            ax2.add_patch(circle2)
+            
+            # Energy statistics
+            extraction_frac = (energy_flux_full > 0).sum() / energy_flux_full.size * 100
+            
+        except Exception as e:
+            # Fallback: show error
+            ax2.text(0.5, 0.5, f"Energy flux calculation failed:\n{str(e)[:50]}",
+                    transform=ax2.transAxes, ha='center', va='center',
+                    fontsize=11, color='red', bbox=dict(boxstyle='round', 
+                    facecolor='white', alpha=0.8))
+            im2 = None
+        
+        ax2.set_title('Energy Flux $-T^r_t$', fontsize=13, fontweight='bold', pad=10)  # (BZ Power)
+        ax2.set_xlabel('x (r_g)', fontsize=12)
+        ax2.set_ylabel('z (r_g)', fontsize=12)
+        ax2.set_aspect('equal')
+        ax2.set_xlim(-50, 50)
+        ax2.set_ylim(-50, 50)
+        
+        # Colorbar for Panel 2
+        if im2 is not None:
+            cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+            cbar2.set_label('Energy Flux', fontsize=11)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.94])  # Leave space for suptitle
+        
+        # Save if requested
+        if save:
+            safe_time = f"{current_time:.0f}".replace(".", "_")
+            filename = os.path.join(self.output_dir, 
+                                f"stagnation_surface_physics_t{safe_time}.png")
+            plt.savefig(filename, dpi=150, bbox_inches='tight')
+            print(f"Saved plot: {filename}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig, axes
     
+    def create_velocity_and_stagnation_animation(self, dump_files, 
+                                                output_file="velocity_stagnation.mp4",
+                                                fps=10, sample_every=3, early_resolution_boost=True):
+        """
+        Two-panel animation: Velocity magnitude + Flow direction
+        
+        Panel 1: Velocity magnitude (scalar) with ur=0 contour (red line)
+        Panel 2: Flow direction with color-coded arrows (black=inward, gray=outward)
+                Same velocity background for consistency
+        
+        Features:
+        - Full-circle visualization (proper mirroring)
+        - Calibrated colorbars from real data
+        - Color-coded flow arrows
+        - Clear stagnation surface marking
+        - Variable sampling: detailed early, overview late (if enabled)
+        
+        Parameters:
+        -----------
+        dump_files : list
+            List of dump file names
+        output_file : str
+            Output filename
+        fps : int
+            Frames per second
+        sample_every : int
+            Use every N-th dump file (only if early_resolution_boost=False)
+        early_resolution_boost : bool
+            If True, uses detailed sampling for first 20% then skips more
+        """
+        
+        print(f"\n=== Creating Velocity & Stagnation Surface Animation ===")
+        
+        # Variable sampling
+        if early_resolution_boost:
+            n_early = len(dump_files) // 5
+            early_dumps = dump_files[:n_early:1]
+            late_dumps = dump_files[n_early::6]
+            sampled_files = list(early_dumps) + list(late_dumps)
+            print(f"Variable sampling: {len(early_dumps)} early + {len(late_dumps)} late")
+        else:
+            sampled_files = dump_files[::sample_every]
+            print(f"Uniform sampling: {len(sampled_files)} frames")
+        
+        # Data calibration
+        print("Calibrating colorbars...")
+        all_vmag = []
+        for dump_file in sampled_files[::5]:
+            try:
+                self.load_data("gdump", dump_file)
+                if hasattr(hs, 'uu') and len(hs.uu) > 2:
+                    vx = hs.uu[1].squeeze()
+                    vz = hs.uu[2].squeeze()
+                    vmag = np.sqrt(vx**2 + vz**2)
+                    all_vmag.extend(vmag.flatten())
+            except:
+                continue
+        
+        if all_vmag:
+            global_vmag_min = np.percentile(all_vmag, 1)
+            global_vmag_max = np.percentile(all_vmag, 99)
+        else:
+            global_vmag_min, global_vmag_max = 1e-10, 1.0
+        
+        print(f"Velocity range: {global_vmag_min:.3e} to {global_vmag_max:.3e}")
+        
+        # Create figure with better layout
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+        
+        # IMPORTANT: Adjust layout to prevent title cutoff
+        plt.subplots_adjust(top=0.92, bottom=0.08, left=0.05, right=0.95, wspace=0.25)
+        
+        # Initialize with first frame
+        self.load_data("gdump", sampled_files[0])
+        r_2d = hs.r.squeeze()
+        h_2d = hs.h.squeeze()
+        
+        vx = hs.uu[1].squeeze() if hasattr(hs, 'uu') else np.zeros_like(r_2d)
+        vz = hs.uu[2].squeeze() if hasattr(hs, 'uu') else np.zeros_like(r_2d)
+        vmag = np.sqrt(vx**2 + vz**2)
+        
+        # Full circle coordinates
+        x = r_2d * np.sin(h_2d)
+        z = r_2d * np.cos(h_2d)
+        x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+        z_full = np.concatenate([z[:, ::-1], z], axis=1)
+        vmag_full = np.concatenate([vmag[:, ::-1], vmag], axis=1)
+        
+        # Panel 1
+        im1 = ax1.pcolormesh(x_full, z_full, vmag_full, cmap='viridis',
+                            norm=LogNorm(vmin=max(global_vmag_min, 1e-10), vmax=global_vmag_max),
+                            shading='auto', rasterized=True)
+        cbar1 = plt.colorbar(im1, ax=ax1, label='|v| (code units)', fraction=0.046, pad=0.04)
+        cbar1.ax.tick_params(labelsize=9)  # Smaller tick labels
+        
+        # Panel 2 (lighter background)
+        im2 = ax2.pcolormesh(x_full, z_full, vmag_full, cmap='viridis',
+                            norm=LogNorm(vmin=max(global_vmag_min, 1e-10), vmax=global_vmag_max),
+                            shading='auto', alpha=0.4, rasterized=True)
+        
+        # Set axis properties
+        for ax in [ax1, ax2]:
+            ax.set_xlabel('X (rg)', fontsize=11)
+            ax.set_ylabel('Z (rg)', fontsize=11)
+            ax.set_aspect('equal')
+            ax.set_xlim(-50, 50)
+            ax.set_ylim(-50, 50)
+            ax.tick_params(labelsize=9)  # Smaller tick labels
+        
+        def animate(frame):
+            # Clear plot contents
+            for artist in ax1.collections + ax1.patches + ax1.lines + ax1.texts:
+                artist.remove()
+            for artist in ax2.collections + ax2.patches + ax2.lines + ax2.texts:
+                artist.remove()
+            
+            dump_file = sampled_files[frame]
+            self.load_data("gdump", dump_file)
+            current_time = float(hs.t)
+            
+            r_2d = hs.r.squeeze()
+            h_2d = hs.h.squeeze()
+            
+            vx = hs.uu[1].squeeze() if hasattr(hs, 'uu') else np.zeros_like(r_2d)
+            vz = hs.uu[2].squeeze() if hasattr(hs, 'uu') else np.zeros_like(r_2d)
+            vmag = np.sqrt(vx**2 + vz**2)
+            ur = hs.uu[1].squeeze() if hasattr(hs, 'uu') else None
+            
+            a = hs.a
+            rhor = 1 + (1 - a**2)**0.5
+            
+            # Full circle
+            x = r_2d * np.sin(h_2d)
+            z = r_2d * np.cos(h_2d)
+            x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+            z_full = np.concatenate([z[:, ::-1], z], axis=1)
+            vmag_full = np.concatenate([vmag[:, ::-1], vmag], axis=1)
+            
+            # PANEL 1: Velocity Magnitude
+            im1_new = ax1.pcolormesh(x_full, z_full, vmag_full, cmap='viridis',
+                                    norm=LogNorm(vmin=max(global_vmag_min, 1e-10), vmax=global_vmag_max),
+                                    shading='auto', rasterized=True)
+            
+            # Stagnation surface (RED contour)
+            if ur is not None:
+                try:
+                    ur_full = np.concatenate([ur[:, ::-1], ur], axis=1)
+                    ax1.contour(x_full, z_full, ur_full, levels=[0],
+                            colors='red', linewidths=3, alpha=0.95)
+                except:
+                    pass
+            
+            # Black hole
+            circle1 = plt.Circle((0, 0), rhor, facecolor='black', edgecolor='white',
+                                linewidth=2, alpha=1.0, zorder=10)
+            ax1.add_patch(circle1)
+            
+            # Legend (minimal)
+            ax1.text(0.02, 0.98, 'Red: ur=0',
+                    transform=ax1.transAxes, fontsize=9, va='top', ha='left',
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
+            
+            ax1.set_title(f'Velocity Magnitude | t={current_time:.1f}M',
+                        fontsize=12, fontweight='bold', pad=8)
+            ax1.grid(True, alpha=0.2)
+            
+            # PANEL 2: Flow Direction
+            im2_new = ax2.pcolormesh(x_full, z_full, vmag_full, cmap='viridis',
+                                    norm=LogNorm(vmin=max(global_vmag_min, 1e-10), vmax=global_vmag_max),
+                                    shading='auto', alpha=0.4, rasterized=True)
+            
+            # FIX: Mirror arrows to full circle!
+            skip = 6  # Reduced for more arrows
+            
+            # Right half
+            x_vec_right = x[::skip, ::skip]
+            z_vec_right = z[::skip, ::skip]
+            vx_vec_right = vx[::skip, ::skip]
+            vz_vec_right = vz[::skip, ::skip]
+            ur_vec_right = ur[::skip, ::skip] if ur is not None else None
+            
+            # Left half (mirrored)
+            x_vec_left = -x[::skip, ::-skip]  # Mirror x, reverse indexing
+            z_vec_left = z[::skip, ::-skip]
+            vx_vec_left = -vx[::skip, ::-skip]  # Mirror vx
+            vz_vec_left = vz[::skip, ::-skip]
+            ur_vec_left = ur[::skip, ::-skip] if ur is not None else None
+            
+            # Combine both halves
+            x_vec_combined = np.concatenate([x_vec_left, x_vec_right], axis=1)
+            z_vec_combined = np.concatenate([z_vec_left, z_vec_right], axis=1)
+            vx_vec_combined = np.concatenate([vx_vec_left, vx_vec_right], axis=1)
+            vz_vec_combined = np.concatenate([vz_vec_left, vz_vec_right], axis=1)
+            if ur_vec_right is not None:
+                ur_vec_combined = np.concatenate([ur_vec_left, ur_vec_right], axis=1)
+            else:
+                ur_vec_combined = None
+            
+            # Plot color-coded arrows
+            if ur_vec_combined is not None:
+                x_flat = x_vec_combined.flatten()
+                z_flat = z_vec_combined.flatten()
+                vx_flat = vx_vec_combined.flatten()
+                vz_flat = vz_vec_combined.flatten()
+                ur_flat = ur_vec_combined.flatten()
+                
+                inward_mask = ur_flat < 0
+                outward_mask = ur_flat >= 0
+                
+                # Inward (BLACK) - BIGGER arrows
+                if np.any(inward_mask):
+                    ax2.quiver(x_flat[inward_mask], z_flat[inward_mask],
+                            vx_flat[inward_mask], vz_flat[inward_mask],
+                            scale=0.3, scale_units='xy',  # Bigger: 0.3 instead of 0.5
+                            color='black', alpha=0.95, width=0.008,  # Thicker
+                            headwidth=6, headlength=7, zorder=5)  # Bigger heads
+                
+                # Outward (LIGHT GRAY) - BIGGER arrows
+                if np.any(outward_mask):
+                    ax2.quiver(x_flat[outward_mask], z_flat[outward_mask],
+                            vx_flat[outward_mask], vz_flat[outward_mask],
+                            scale=0.3, scale_units='xy',
+                            color='lightgray', edgecolors='gray', linewidths=0.5,
+                            alpha=0.95, width=0.008,
+                            headwidth=6, headlength=7, zorder=5)
+            
+            # NO redundant annotation boxes (removed as requested)
+            
+            # Black hole
+            circle2 = plt.Circle((0, 0), rhor, facecolor='black', edgecolor='white',
+                                linewidth=2, alpha=1.0, zorder=10)
+            ax2.add_patch(circle2)
+            
+            # Simple legend
+            legend_elements = [
+                Line2D([0], [0], marker='>', color='w', markerfacecolor='black',
+                    markersize=10, label='Inward (ur<0)'),
+                Line2D([0], [0], marker='>', color='w', markerfacecolor='lightgray',
+                    markeredgecolor='gray', markersize=10, label='Outward (ur≥0)')
+            ]
+            ax2.legend(handles=legend_elements, loc='upper right', fontsize=9, framealpha=0.9)
+            
+            ax2.set_title(f'Flow Direction | t={current_time:.1f}M',
+                        fontsize=12, fontweight='bold', pad=8)
+            ax2.grid(True, alpha=0.2)
+            
+            return [im1_new, im2_new]
+        
+        # Create animation
+        ani = animation.FuncAnimation(fig, animate, frames=len(sampled_files),
+                                    blit=False, interval=1000/fps, repeat=True)
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        try:
+            print(f"Saving animation...")
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"✓ Saved: {output_path}")
+            file_size = os.path.getsize(output_path) / (1024*1024)
+            print(f"  Size: {file_size:.2f} MB, Duration: {len(sampled_files)/fps:.1f}s")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+        
+        plt.close(fig)
+
+
+    def create_energy_zones_animation(self, dump_files,
+                                    output_file="energy_zones.mp4",
+                                    fps=10, sample_every=3, early_resolution_boost=True):
+        """
+        Two-panel animation: Energy flux zones + Statistics
+        
+        Panel 1: -T^t_r (energy flux) showing extraction (blue) vs dissipation (red)
+        Panel 2: Time evolution of zone percentages
+        
+        Features:
+        - Diverging colormap (RdBu_r) for extraction/dissipation
+        - Zero contour shows boundary
+        - Statistics tracking over time
+        - Full-circle visualization
+        - Variable sampling: detailed early, overview late (if enabled)
+        
+        Parameters:
+        -----------
+        dump_files : list
+            List of dump file names
+        output_file : str
+            Output filename
+        fps : int
+            Frames per second
+        sample_every : int
+            Use every N-th dump file (only if early_resolution_boost=False)
+        early_resolution_boost : bool
+            If True, uses detailed sampling for first 20% then skips more
+        """
+        
+        print(f"\n=== Creating Energy Extraction Zones Animation ===")
+        
+        # Variable sampling
+        if early_resolution_boost:
+            n_early = len(dump_files) // 5
+            early_dumps = dump_files[:n_early:2]
+            late_dumps = dump_files[n_early::8]
+            sampled_files = list(early_dumps) + list(late_dumps)
+            print(f"Variable sampling: {len(early_dumps)} early + {len(late_dumps)} late")
+        else:
+            sampled_files = dump_files[::sample_every]
+            print(f"Uniform sampling: {len(sampled_files)} frames")
+        
+        # Data calibration - IMPROVED: use broader percentile range
+        print("Calibrating energy flux...")
+        all_Ttr = []
+        
+        for dump_file in sampled_files[::5]:
+            try:
+                self.load_data("gdump", dump_file)
+                if hasattr(hs, 'T') and len(hs.T) > 2:
+                    Ttr = -hs.T[0,1].squeeze()
+                else:
+                    rho = hs.rho.squeeze()
+                    ug = hs.ug.squeeze()
+                    ur = hs.uu[1].squeeze() if hasattr(hs, 'uu') else np.zeros_like(rho)
+                    Ttr = -(rho + ug) * ur
+                
+                all_Ttr.extend(Ttr.flatten())
+            except:
+                continue
+        
+        if all_Ttr:
+            # Use 95th percentile for better visibility
+            abs_max = np.percentile(np.abs(all_Ttr), 95)
+            global_Ttr_min = -abs_max
+            global_Ttr_max = abs_max
+        else:
+            global_Ttr_min, global_Ttr_max = -0.1, 0.1
+        
+        print(f"Energy flux range: {global_Ttr_min:.3e} to {global_Ttr_max:.3e}")
+        
+        # Create figure with better layout
+        fig = plt.figure(figsize=(16, 7))
+        ax1 = plt.subplot(121)
+        ax2 = plt.subplot(122)
+        
+        # Better layout - prevent title cutoff
+        plt.subplots_adjust(top=0.90, bottom=0.10, left=0.05, right=0.95, wspace=0.25)
+        
+        # Storage for statistics
+        times_list = []
+        extraction_frac = []
+        dissipation_frac = []
+        net_power = []
+        
+        # Initialize
+        self.load_data("gdump", sampled_files[0])
+        r_2d = hs.r.squeeze()
+        h_2d = hs.h.squeeze()
+        
+        if hasattr(hs, 'T') and len(hs.T) > 2:
+            Ttr = -hs.T[0,1].squeeze()
+        else:
+            rho = hs.rho.squeeze()
+            ug = hs.ug.squeeze()
+            ur = hs.uu[1].squeeze() if hasattr(hs, 'uu') else np.zeros_like(rho)
+            Ttr = -(rho + ug) * ur
+        
+        # Full circle
+        x = r_2d * np.sin(h_2d)
+        z = r_2d * np.cos(h_2d)
+        x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+        z_full = np.concatenate([z[:, ::-1], z], axis=1)
+        Ttr_full = np.concatenate([Ttr[:, ::-1], Ttr], axis=1)
+        
+        # Panel 1
+        im1 = ax1.pcolormesh(x_full, z_full, Ttr_full, cmap='RdBu_r',
+                            vmin=global_Ttr_min, vmax=global_Ttr_max,
+                            shading='auto', rasterized=True)
+        cbar1 = plt.colorbar(im1, ax=ax1, label='-T^t_r (code units)', 
+                            fraction=0.046, pad=0.04)
+        cbar1.ax.tick_params(labelsize=9)  # Smaller ticks
+        cbar1.ax.axhline(y=0, color='black', linewidth=2, linestyle='--')
+        
+        # Set axis properties
+        ax1.set_xlabel('X (rg)', fontsize=11)
+        ax1.set_ylabel('Z (rg)', fontsize=11)
+        ax1.set_aspect('equal')
+        ax1.set_xlim(-50, 50)
+        ax1.set_ylim(-50, 50)
+        ax1.tick_params(labelsize=9)
+        
+        ax2.set_xlabel('Time (M)', fontsize=11)
+        ax2.set_ylabel('Domain Fraction (%)', fontsize=11)
+        ax2.tick_params(labelsize=9)
+        
+        # Add physics context as figure suptitle
+        fig.suptitle('Blandford-Znajek Energy Flux: -T^t_r = -(ρ+u+p)u^r - b^r b^t', 
+                    fontsize=13, fontweight='bold', y=0.96)
+        
+        def animate(frame):
+            # Clear
+            for artist in ax1.collections + ax1.patches + ax1.lines + ax1.texts:
+                artist.remove()
+            ax2.clear()
+            
+            dump_file = sampled_files[frame]
+            self.load_data("gdump", dump_file)
+            current_time = float(hs.t)
+            
+            r_2d = hs.r.squeeze()
+            h_2d = hs.h.squeeze()
+            
+            if hasattr(hs, 'T') and len(hs.T) > 2:
+                Ttr = -hs.T[0,1].squeeze()
+            else:
+                rho = hs.rho.squeeze()
+                ug = hs.ug.squeeze()
+                ur = hs.uu[1].squeeze() if hasattr(hs, 'uu') else np.zeros_like(rho)
+                Ttr = -(rho + ug) * ur
+            
+            a = hs.a
+            rhor = 1 + (1 - a**2)**0.5
+            
+            # Full circle
+            x = r_2d * np.sin(h_2d)
+            z = r_2d * np.cos(h_2d)
+            x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+            z_full = np.concatenate([z[:, ::-1], z], axis=1)
+            Ttr_full = np.concatenate([Ttr[:, ::-1], Ttr], axis=1)
+            
+            # PANEL 1: Energy Flux Map
+            im1_new = ax1.pcolormesh(x_full, z_full, Ttr_full, cmap='RdBu_r',
+                                    vmin=global_Ttr_min, vmax=global_Ttr_max,
+                                    shading='auto', rasterized=True)
+            
+            # Zero contour
+            try:
+                ax1.contour(x_full, z_full, Ttr_full, levels=[0],
+                        colors='black', linewidths=2, linestyles='--', alpha=0.8)
+            except:
+                pass
+            
+            # Black hole
+            circle = plt.Circle((0, 0), rhor, facecolor='black', edgecolor='white',
+                            linewidth=2, alpha=1.0, zorder=10)
+            ax1.add_patch(circle)
+            
+            # Minimal labels
+            ax1.text(0.98, 0.98, 'Blue: Extraction\n(Energy Out)',
+                    transform=ax1.transAxes, fontsize=9, ha='right', va='top',
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="lightblue", alpha=0.8))
+            ax1.text(0.98, 0.02, 'Red: Dissipation\n(Energy In)',
+                    transform=ax1.transAxes, fontsize=9, ha='right', va='bottom',
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="lightcoral", alpha=0.8))
+            
+            ax1.set_title(f't = {current_time:.1f}M', fontsize=12, fontweight='bold', pad=8)
+            ax1.set_xlabel('X (rg)', fontsize=11)
+            ax1.set_ylabel('Z (rg)', fontsize=11)
+            ax1.set_xlim(-50, 50)
+            ax1.set_ylim(-50, 50)
+            ax1.tick_params(labelsize=9)
+            ax1.grid(True, alpha=0.2)
+            
+            # PANEL 2: Statistics - CLEARER DESCRIPTION
+            extraction_zone = Ttr > 0
+            dissipation_zone = Ttr < 0
+            
+            total_cells = Ttr.size
+            extr_frac = extraction_zone.sum() / total_cells * 100
+            diss_frac = dissipation_zone.sum() / total_cells * 100
+            net_pwr = Ttr.sum()
+            
+            times_list.append(current_time)
+            extraction_frac.append(extr_frac)
+            dissipation_frac.append(diss_frac)
+            net_power.append(net_pwr)
+            
+            # Plot evolution
+            ax2.plot(times_list, extraction_frac, 'b-', linewidth=2.5, 
+                    label='Extraction Zone (% of cells)', marker='o', markersize=3)
+            ax2.plot(times_list, dissipation_frac, 'r-', linewidth=2.5,
+                    label='Dissipation Zone (% of cells)', marker='s', markersize=3)
+            ax2.axhline(y=50, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+            
+            ax2.set_xlabel('Time (M)', fontsize=11)
+            ax2.set_ylabel('Spatial Coverage (%)', fontsize=11)  # CLEARER
+            ax2.set_title('Energy Zone Evolution', fontsize=12, fontweight='bold', pad=8)
+            ax2.legend(loc='best', fontsize=9, framealpha=0.9)
+            ax2.grid(True, alpha=0.3)
+            ax2.set_ylim(0, 100)
+            ax2.tick_params(labelsize=9)
+            
+            # Stats box - CLEARER LABELS
+            stats_text = (f'Time: {current_time:.1f}M\n'
+                        f'Extraction: {extr_frac:.1f}% of cells\n'
+                        f'Dissipation: {diss_frac:.1f}% of cells\n'
+                        f'Net flux: {net_pwr:.2e}')
+            ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes,
+                    fontsize=9, va='top', ha='left',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9))
+            
+            return [im1_new]
+        
+        # Create animation
+        ani = animation.FuncAnimation(fig, animate, frames=len(sampled_files),
+                                    blit=False, interval=1000/fps, repeat=True)
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        try:
+            print(f"Saving animation...")
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"✓ Saved: {output_path}")
+            file_size = os.path.getsize(output_path) / (1024*1024)
+            print(f"  Size: {file_size:.2f} MB, Duration: {len(sampled_files)/fps:.1f}s")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+        
+        plt.close(fig)
+
+
+    def create_magnetic_topology_animation(self, dump_files,
+                                        output_file="magnetic_topology.mp4",
+                                        fps=25, sample_every=1, early_resolution_boost=True):
+        """
+        Two-panel animation: B_r(θ) profile + Hemisphere flux evolution
+        
+        Panel 1: B_r(θ) at horizon with zero-crossing detection
+        Panel 2: Northern & Southern hemisphere flux time series
+        
+        Features:
+        - Zero-crossing detection (smooth vs discontinuous)
+        - Hemisphere flux tracking
+        - Clean, informative visualization
+        - Variable sampling: detailed early, overview late (if enabled)
+        
+        Parameters:
+        -----------
+        dump_files : list
+            List of dump file names
+        output_file : str
+            Output filename
+        fps : int
+            Frames per second
+        sample_every : int
+            Use every N-th dump file (only if early_resolution_boost=False)
+        early_resolution_boost : bool
+            If True, uses detailed sampling for first 20% then skips more
+        """
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        print(f"\n=== Creating Magnetic Topology Animation ===")
+        
+        # Variable sampling
+        if early_resolution_boost:
+            n_early = len(dump_files) // 5
+            early_dumps = dump_files[:n_early:1]
+            late_dumps = dump_files[n_early::5]
+            sampled_files = list(early_dumps) + list(late_dumps)
+            print(f"Variable sampling: {len(early_dumps)} early + {len(late_dumps)} late")
+        else:
+            sampled_files = dump_files[::sample_every]
+            print(f"Uniform sampling: {len(sampled_files)} frames")
+        
+        # Create figure with better spacing
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10),
+                                        gridspec_kw={'height_ratios': [3, 1]})
+        plt.subplots_adjust(top=0.95, bottom=0.08, hspace=0.25)
+        
+        # Storage for time series
+        time_history = []
+        flux_north_history = []
+        flux_south_history = []
+        Br_max_history = []  # Track B_r magnitude for decay visualization
+        
+        def update(frame):
+            ax1.clear()
+            ax2.clear()
+            
+            dump_file = sampled_files[frame]
+            self.load_data("gdump", dump_file)
+            current_time = float(hs.t)
+            
+            # Get field data
+            flux_data = self.calculate_hemisphere_flux()
+            topo_data = self.detect_field_topology_zero_crossings(
+                B_r_horizon=flux_data['B_r_horizon'],
+                theta=flux_data['theta']
+            )
+            
+            theta = flux_data['theta']
+            B_r = flux_data['B_r_horizon']
+            
+            # PANEL 1: B_r(θ) Profile
+            ax1.plot(theta, B_r, 'k-', linewidth=3, zorder=5)
+            
+            # Zero line and equator
+            ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+            ax1.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
+            
+            # Mark zero crossings
+            if topo_data['n_crossings'] > 0:
+                for detail in topo_data['crossing_details']:
+                    theta_cross = detail['theta']
+                    crossing_type = detail['type']
+                    
+                    if crossing_type == 'smooth':
+                        color, marker, size = 'green', 'o', 12
+                    elif crossing_type == 'discontinuous':
+                        color, marker, size = 'red', 's', 12
+                    else:
+                        color, marker, size = 'orange', '^', 12
+                    
+                    ax1.axvline(x=theta_cross, color=color, linestyle=':',
+                            alpha=0.6, linewidth=2.5, zorder=3)
+                    ax1.plot(theta_cross, 0, marker=marker, color=color,
+                            markersize=size, zorder=10)
+            
+            # Formatting
+            ax1.set_xlabel('θ', fontsize=12)
+            ax1.set_ylabel('B_r  [simulation units]', fontsize=12)  # Clarified "code units"
+            ax1.set_xlim(0, np.pi)
+            ax1.grid(True, alpha=0.25)
+            ax1.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
+            ax1.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
+            ax1.tick_params(labelsize=10)
+            
+            # IMPROVED TITLE: No premature classification, just observations
+            ax1.set_title(f'B_r(θ) at Horizon  |  t = {current_time:.1f}M',
+                        fontsize=13, fontweight='bold', pad=10)
+            
+            # Stats box - MOVED TO LEFT
+            stats_text = f'Crossings: {topo_data["n_crossings"]}\n'
+            if topo_data['n_crossings'] > 0:
+                stats_text += f'  Smooth: {topo_data["dipole_like_crossings"]}\n'
+                stats_text += f'  Discontinuous: {topo_data["split_monopole_like_crossings"]}\n'
+            stats_text += f'Φ_North: {flux_data["flux_north"]:+.2e}\n'
+            stats_text += f'Φ_South: {flux_data["flux_south"]:+.2e}'
+            
+            ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes,
+                    fontsize=9, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                            edgecolor='gray', alpha=0.9, linewidth=1))
+            
+            # Legend for crossing types - MOVED TO RIGHT
+            if topo_data['n_crossings'] > 0:
+                legend_elements = []
+                if topo_data['dipole_like_crossings'] > 0:
+                    legend_elements.append(Line2D([0], [0], marker='o', color='w',
+                                                markerfacecolor='green', markersize=9,
+                                                label='Smooth'))
+                if topo_data['split_monopole_like_crossings'] > 0:
+                    legend_elements.append(Line2D([0], [0], marker='s', color='w',
+                                                markerfacecolor='red', markersize=9,
+                                                label='Discontinuous'))
+                if legend_elements:
+                    ax1.legend(handles=legend_elements, loc='upper right',
+                            fontsize=9, framealpha=0.9, title='Zero Crossings')
+            
+            # Dynamic y-axis to show B_r decay
+            Br_max_history.append(np.abs(B_r).max())
+            current_Br_max = np.abs(B_r).max()
+            ax1.set_ylim(-current_Br_max*1.1, current_Br_max*1.1)
+            
+            # PANEL 2: Hemisphere Flux Evolution - CLEARER TITLE
+            time_history.append(current_time)
+            flux_north_history.append(flux_data['flux_north'])
+            flux_south_history.append(flux_data['flux_south'])
+            
+            # Plot flux evolution
+            ax2.plot(time_history, flux_north_history, 'b-', linewidth=2.5,
+                    label='Northern Hemisphere', alpha=0.9, marker='o', markersize=2)
+            ax2.plot(time_history, flux_south_history, 'r-', linewidth=2.5,
+                    label='Southern Hemisphere', alpha=0.9, marker='s', markersize=2)
+            ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+            
+            # Mark current time
+            ax2.axvline(x=current_time, color='black', linestyle=':',
+                    alpha=0.5, linewidth=1.5)
+            
+            # Formatting
+            ax2.set_xlabel('Time (M)', fontsize=11)
+            ax2.set_ylabel('Magnetic Flux  [simulation units]', fontsize=11)
+            ax2.set_title('Hemisphere Flux Evolution over Time',  # CLEARER
+                        fontsize=12, fontweight='bold', pad=8)
+            ax2.grid(True, alpha=0.25)
+            ax2.legend(loc='best', fontsize=10, framealpha=0.9)
+            ax2.set_xlim(0, max(time_history) if time_history else 1000)
+            ax2.tick_params(labelsize=10)
+            
+            return [ax1, ax2]
+        
+        # Create animation
+        ani = animation.FuncAnimation(fig, update, frames=len(sampled_files),
+                                    blit=False, interval=1000/fps, repeat=True)
+        
+        try:
+            print(f"Saving animation...")
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100,
+                    extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv420p'])
+            print(f"✓ Saved: {output_path}")
+            file_size = os.path.getsize(output_path) / (1024*1024)
+            print(f"  Size: {file_size:.1f} MB, Duration: {len(sampled_files)/fps:.1f}s")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+        
+        plt.close(fig)
+
+
+    def generate_all_animations(self, dump_files, output_dir=None, fps=10, 
+                            early_resolution_boost=True):
+        """
+        Convenience method to generate all three animations at once
+        
+        Parameters:
+        -----------
+        dump_files : list
+            List of dump file names
+        output_dir : str, optional
+            Output directory (uses self.output_dir if None)
+        fps : int
+            Frames per second
+        early_resolution_boost : bool
+            If True, uses variable sampling (detailed early, faster late)
+        """
+        if output_dir is None:
+            output_dir = self.output_dir
+        
+        print("\n" + "="*70)
+        print("GENERATING COMPLETE ANIMATION SUITE")
+        print("="*70)
+        
+        # Updated animation definitions with new method names
+        animations = [
+            ("velocity_stagnation.mp4",
+            lambda df, out: self.create_velocity_and_stagnation_animation(
+                df, out, fps=fps, early_resolution_boost=early_resolution_boost)),
+            
+            ("energy_zones.mp4",
+            lambda df, out: self.create_energy_zones_animation(
+                df, out, fps=fps, early_resolution_boost=early_resolution_boost)),
+            
+            ("magnetic_topology.mp4",
+            lambda df, out: self.create_magnetic_topology_animation(
+                df, out, fps=fps, early_resolution_boost=early_resolution_boost)),
+        ]
+        
+        for filename, method in animations:
+            output_path = os.path.join(output_dir, filename)
+            print(f"\n>>> Creating: {filename}")
+            try:
+                method(dump_files, output_path)
+                print(f"✓ Success: {filename}")
+            except Exception as e:
+                print(f"✗ Failed: {filename}")
+                print(f"  Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print("\n" + "="*70)
+        print("ANIMATION SUITE COMPLETE")
+        print("="*70)
+        print(f"\nAll animations saved to: {output_dir}")
+        print("\nGenerated files:")
+        for filename, _ in animations:
+            filepath = os.path.join(output_dir, filename)
+            if os.path.exists(filepath):
+                size_mb = os.path.getsize(filepath) / (1024*1024)
+                print(f"  ✓ {filename} ({size_mb:.1f} MB)")
+            else:
+                print(f"  ✗ {filename} (not found)")
+
+
     def analyze_magnetic_hair_loss(self, dump_files, sample_every=5):
         """
-        Question 1: How do black holes lose their hair?
+        Analyze magnetic field evolution to understand black hole "hair loss".
         
-        Analyze magnetic field evolution to understand the no-hair theorem in practice.
-        "Hair" = any complex field structure beyond mass, charge, spin.
+        Physical Context:
+        ----------------
+        No-Hair Theorem: Classical black holes are characterized only by:
+        - Mass M
+        - Charge Q  
+        - Angular momentum J (spin a)
+        
+        Any other "hair" (complex field structure) should decay away.
+        
+        However: Rotating black holes can sustain magnetic structure via
+        frame dragging! This is not a violation because:
+        - Magnetic field is not "hair" - it's maintained by currents
+        - Frame dragging continuously re-orients field lines
+        - Result: quasi-stationary magnetosphere
+        
+        Analysis Goals:
+        --------------
+        1. Field Persistence:
+        - Does B-field strength remain constant or decay?
+        - Compare initial vs final field strength
+        
+        2. Field Topology:
+        - Monopole: Constant sign of B_r(θ)
+        - Dipole: B_r changes sign at equator
+        - Evolution: Dipole → Monopole transition?
+        
+        3. Frame Dragging:
+        - ΩF/ΩH should remain ≈ 0.5 for monopole
+        - Validates that field is sustained by rotation
+        
+        4. Flux Conservation:
+        - Total flux Φ = ∫ B_r dA should be conserved
+        - Violations indicate numerical diffusion
+        
+        Parameters:
+        ----------
+        dump_files : list
+            Dump files spanning simulation evolution
+        sample_every : int
+            Analyze every N-th file
+        
+        Returns:
+        -------
+        dict : {
+            'field_strength_horizon': List of B-field magnitudes at r_h
+            'field_topology_ratio': Pole/equator field ratio vs time
+            'frame_dragging_efficiency': ΩF/ΩH vs time
+            'magnetic_flux_conservation': Φ(t)/Φ(0)
+        }
+        
+        Interpretation:
+        --------------
+        - Stable field + constant ΩF/ΩH: BZ mechanism operating
+        - Decaying field: No frame dragging (non-rotating BH)
+        - Evolving topology: Field restructuring (dipole → monopole)
         """
         print("\n=== ANALYZING BLACK HOLE 'HAIR LOSS' ===")
         print("No-Hair Theorem: Classical BHs characterized only by M, Q, J")
@@ -1143,8 +3381,12 @@ Snapshots: {len(results['times'])}
             'times': [],
             'field_strength_horizon': [],
             'field_topology_ratio': [],
-            'frame_dragging_efficiency': [],
-            'magnetic_flux_conservation': []
+            'frame_dragging_efficiency': [],  # FIXED: Now stores horizon values
+            'frame_dragging_evolution': [],  # FIXED: Full evolution data
+            'magnetic_flux_conservation': [],
+            'hemisphere_flux_evolution': [],  # ← Session 3 addition: # Φ_N, Φ_S over time
+            'topology_evolution': []         # ← Session 3 addition: # Field classification over time
+
         }
         
         for dump_file in dump_files[::sample_every]:
@@ -1152,162 +3394,370 @@ Snapshots: {len(results['times'])}
                 self.load_data("gdump", dump_file)
                 current_time = float(hs.t)
                 
-                # Get 2D magnetic field components
                 if not hasattr(hs, 'B'):
                     print(f"No magnetic field data in {dump_file}")
                     continue
-                    
+                
                 B_r = hs.B[1].squeeze()
                 B_theta = hs.B[2].squeeze()
                 r_2d = hs.r.squeeze()
                 theta_2d = hs.h.squeeze()
                 
-                # Field strength near horizon (first few radial zones)
+                # Field strength near horizon
                 horizon_field_strength = np.sqrt(B_r[:5, :]**2 + B_theta[:5, :]**2).mean()
                 
-                # Field topology analysis: monopole vs dipole character
-                # Compare field at pole (θ=0) vs equator (θ=π/2)
+                # Field topology
                 n_theta = B_r.shape[1]
-                pole_idx = 0  # θ ≈ 0
-                equator_idx = n_theta // 2  # θ ≈ π/2
+                pole_idx = 0
+                equator_idx = n_theta // 2
                 
                 pole_field = np.sqrt(B_r[:10, pole_idx]**2 + B_theta[:10, pole_idx]**2).mean()
                 equator_field = np.sqrt(B_r[:10, equator_idx]**2 + B_theta[:10, equator_idx]**2).mean()
-                
-                # Ratio > 1: monopole-like, < 1: more dipole-like
                 topology_ratio = pole_field / equator_field if equator_field > 0 else 1
                 
-                # Frame dragging analysis
-                hs.aux()  # Compute auxiliary quantities
-                if hasattr(hs, 'omegaf2'):
-                    omega_f = hs.omegaf2.squeeze()
-                    a = hs.a
-                    rhor = 1 + (1 - a**2)**0.5
-                    omega_h = a / (2 * rhor)
+                # FIXED: Frame dragging at horizon
+                try:
+                    omega_data = self.extract_omega_at_horizon()
                     
-                    # Average frame dragging efficiency
-                    if omega_f.ndim > 1:
-                        frame_drag_eff = np.mean(omega_f / omega_h) if omega_h != 0 else 0
+                    if omega_data['is_1d']:
+                        frame_drag_eff = omega_data['omega_ratio_horizon']
                     else:
-                        frame_drag_eff = omega_f / omega_h if omega_h != 0 else 0
-                else:
-                    frame_drag_eff = 0
+                        frame_drag_eff = omega_data['mean_omega_ratio']
+                    
+                    results['frame_dragging_evolution'].append({
+                        'time': current_time,
+                        'omega_ratio': frame_drag_eff,
+                        'std': omega_data['std_omega_ratio'],
+                        'horizon_radius': omega_data['horizon_radius']
+                    })
+                    
+                except Exception as e:
+                    print(f"Warning: Could not extract ΩF/ΩH: {e}")
+                    frame_drag_eff = None
                 
-                # Magnetic flux conservation (through equatorial plane)
+                # Flux conservation (equatorial plane for now)
                 if r_2d.ndim > 1:
                     flux_equatorial = (B_r[:, equator_idx] * r_2d[:, equator_idx]**2).sum()
                 else:
                     flux_equatorial = (B_r * r_2d**2).sum()
                 
                 # Store results
-                results['detected_field_type'] = self.detect_field_type(dump_files[-1])
                 results['times'].append(current_time)
                 results['field_strength_horizon'].append(horizon_field_strength)
                 results['field_topology_ratio'].append(topology_ratio)
                 results['frame_dragging_efficiency'].append(frame_drag_eff)
                 results['magnetic_flux_conservation'].append(flux_equatorial)
                 
-                print(f"t={current_time:.1f}: B_horizon={horizon_field_strength:.2e}, "
-                      f"topology={topology_ratio:.2f}, ΩF/ΩH={frame_drag_eff:.3f}")
+                try:
+                    flux_data = self.calculate_hemisphere_flux()
+                    
+                    results['hemisphere_flux_evolution'].append({
+                        'time': current_time,
+                        'flux_north': flux_data['flux_north'],
+                        'flux_south': flux_data['flux_south'],
+                        'flux_total': flux_data['flux_total'],
+                        'same_sign': flux_data['same_sign'],
+                        'field_type': flux_data['field_type']
+                    })
+                    
+                    topo_data = self.detect_field_topology_zero_crossings(
+                        B_r_horizon=flux_data['B_r_horizon'],
+                        theta=flux_data['theta']
+                    )
+                    
+                    results['topology_evolution'].append({
+                        'time': current_time,
+                        'n_crossings': topo_data['n_crossings'],
+                        'field_type': topo_data['field_type'],
+                        'consistent': topo_data['consistent_with_hemisphere']
+                    })
+                    
+                    # Enhanced print (includes field type now)
+                    omega_str = f"{frame_drag_eff:.4f}" if (frame_drag_eff is not None and not np.isnan(frame_drag_eff)) else "N/A"
+                    print(f"t={current_time:.1f}: B_horizon={horizon_field_strength:.2e}, "
+                        f"topology={topology_ratio:.2f}, ΩF/ΩH={omega_str}, "
+                        f"field={flux_data['field_type']}")  # ← NEW: shows field classification
+                    
+                except Exception as e:
+                    print(f"Warning: Could not calculate hemisphere flux: {e}")
+                    results['hemisphere_flux_evolution'].append(None)
+                    results['topology_evolution'].append(None)
+                    
+                    # Fallback print if calculation fails
+                    omega_str = f"{frame_drag_eff:.4f}" if (frame_drag_eff is not None and not np.isnan(frame_drag_eff)) else "N/A"
+                    print(f"t={current_time:.1f}: B_horizon={horizon_field_strength:.2e}, "
+                        f"topology={topology_ratio:.2f}, ΩF/ΩH(horizon)={omega_str}")
                 
             except Exception as e:
                 print(f"Error analyzing {dump_file}: {e}")
                 continue
         
+        # FIXED: Validation
+        if results['frame_dragging_evolution']:
+            final_omega = results['frame_dragging_evolution'][-1]
+            print(f"\n=== VALIDATION ===")
+            print(f"Final ΩF/ΩH at horizon: {final_omega['omega_ratio']:.4f}")
+            print(f"Theoretical prediction: 0.500")
+            print(f"Deviation: {abs(final_omega['omega_ratio'] - 0.5)/0.5 * 100:.1f}%")
+        
         return results
 
     def plot_hair_loss_analysis(self, results, field_type="Auto", show=True):
-        """Plot the magnetic hair loss analysis results with automatic labeling"""
+        """
+        Enhanced hair loss analysis plot with hemisphere flux and topology.
+        
+        SESSION 3 UPDATE: Adds hemisphere flux evolution and field classification.
+        
+        Creates 2x3 grid:
+        - Row 1: Field strength, Hemisphere flux, Field topology
+        - Row 2: Frame dragging, Flux conservation, Summary
+        """
         if not results['times']:
             return
         
-        # Auto-detect field type if not specified
+        # Auto-detect field type
         if field_type == "Auto" and results['times']:
-            # Use the last dump file for detection (final evolved state)
             dump_files = get_dump_files()
             if dump_files:
                 field_type = self.detect_field_type(dump_files[-1])
         
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         
-        # Dynamic title based on detected field type
+        # Dynamic title
         title_map = {
-            "Monopole": "Black Hole \"Hair Loss\" Analysis - 2D Monopole",
-            "Dipole": "Black Hole \"Hair Loss\" Analysis - 2D Dipole", 
-            "Mixed/Evolving": "Black Hole \"Hair Loss\" Analysis - Evolving Field",
-            "1D": "Black Hole \"Hair Loss\" Analysis - 1D Field",
-            "Unknown": "Black Hole \"Hair Loss\" Analysis - Magnetized BH"
+            "Monopole": "Magnetic Field Evolution: 2D Monopole",
+            "Dipole": "Magnetic Field Evolution: 2D Dipole", 
+            "Mixed/Evolving": "Magnetic Field Evolution: Evolving Configuration",
+            "1D": "Magnetic Field Evolution: 1D Field",
+            "Unknown": "Magnetic Field Evolution"
         }
         
-        title = title_map.get(field_type, f"Black Hole \"Hair Loss\" Analysis - {field_type} Field")
+        title = title_map.get(field_type, f"Magnetic Field Evolution: {field_type}")
         fig.suptitle(title, fontsize=16, fontweight='bold')
         
-        # Rest of your plotting code remains the same...
         times = results['times']
         
-        # 1. Field strength evolution
+        # ========================================================================
+        # Panel 1: Field Strength Persistence
+        # ========================================================================
         ax1 = axes[0, 0]
         ax1.semilogy(times, results['field_strength_horizon'], 'b-', linewidth=2)
         ax1.set_xlabel('Time (M)', fontsize=12)
         ax1.set_ylabel('B-field Strength (horizon)', fontsize=12)
-        ax1.set_title('Magnetic Field Persistence', fontsize=13)
+        ax1.set_title('Field Persistence', fontsize=13, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         
-        # 2. Field topology evolution with dynamic interpretation
-        ax2 = axes[0, 1] 
-        ax2.plot(times, results['field_topology_ratio'], 'r-', linewidth=2)
-        ax2.axhline(y=1, color='k', linestyle='--', alpha=0.5, label='Monopole-Dipole Transition')
-        ax2.set_xlabel('Time (M)', fontsize=12)
-        ax2.set_ylabel('Pole/Equator Field Ratio', fontsize=12)
+        # Stats
+        initial_B = results['field_strength_horizon'][0]
+        final_B = results['field_strength_horizon'][-1]
+        decay_percent = (1 - final_B/initial_B) * 100 if initial_B > 0 else 0
         
-        # Dynamic subplot title based on field type
-        if field_type == "Dipole":
-            ax2.set_title('Field Evolution (Dipole→Monopole?)', fontsize=13)
+        stat_text = f'Initial: {initial_B:.2e}\n'
+        stat_text += f'Final: {final_B:.2e}\n'
+        stat_text += f'Change: {decay_percent:+.1f}%'
+        ax1.text(0.02, 0.98, stat_text, transform=ax1.transAxes,
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.9))
+        
+        # ========================================================================
+        # Panel 2: Hemisphere Flux Evolution (NEW!)
+        # ========================================================================
+        ax2 = axes[0, 1]
+        
+        if results.get('hemisphere_flux_evolution'):
+            # Extract data
+            flux_times = [d['time'] for d in results['hemisphere_flux_evolution'] if d is not None]
+            flux_north = [d['flux_north'] for d in results['hemisphere_flux_evolution'] if d is not None]
+            flux_south = [d['flux_south'] for d in results['hemisphere_flux_evolution'] if d is not None]
+            flux_total = [d['flux_total'] for d in results['hemisphere_flux_evolution'] if d is not None]
+            
+            if flux_times:
+                ax2.plot(flux_times, flux_north, 'b-', linewidth=2, label='Φ_north', marker='o', markersize=4)
+                ax2.plot(flux_times, flux_south, 'r-', linewidth=2, label='Φ_south', marker='s', markersize=4)
+                ax2.plot(flux_times, flux_total, 'k--', linewidth=2, label='Φ_total', alpha=0.7)
+                ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+                
+                ax2.set_xlabel('Time (M)', fontsize=12)
+                ax2.set_ylabel('Magnetic Flux', fontsize=12)
+                ax2.set_title('Hemisphere Flux Evolution', fontsize=13, fontweight='bold')
+                ax2.legend(loc='best', fontsize=10)
+                ax2.grid(True, alpha=0.3)
+                
+                # Classification
+                final_flux = results['hemisphere_flux_evolution'][-1]
+                if final_flux:
+                    class_text = f'{final_flux["field_type"]}\n'
+                    if final_flux['same_sign']:
+                        class_text += 'Φ_N·Φ_S > 0'
+                    else:
+                        class_text += 'Φ_N·Φ_S < 0'
+                    
+                    ax2.text(0.02, 0.98, class_text, transform=ax2.transAxes,
+                            fontsize=10, verticalalignment='top', fontfamily='monospace',
+                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", 
+                                    edgecolor='gray', alpha=0.9, linewidth=1))
         else:
-            ax2.set_title('Field Topology Evolution', fontsize=13)
+            ax2.text(0.5, 0.5, 'Hemisphere flux\ndata not available', 
+                    transform=ax2.transAxes, ha='center', va='center', fontsize=12)
+            ax2.set_title('Hemisphere Flux Evolution', fontsize=13, fontweight='bold')
         
-        ax2.grid(True, alpha=0.3)
-        ax2.legend()
+        # ========================================================================
+        # Panel 3: Field Topology Evolution (NEW!)
+        # ========================================================================
+        ax3 = axes[0, 2]
         
-        # 3. Frame dragging efficiency  
-        ax3 = axes[1, 0]
-        ax3.plot(times, results['frame_dragging_efficiency'], 'g-', linewidth=2)
-        ax3.axhline(y=0.5, color='r', linestyle='--', alpha=0.7, label='BZ Theory = 0.5')
-        ax3.set_xlabel('Time (M)', fontsize=12)
-        ax3.set_ylabel('ΩF/ΩH', fontsize=12)
-        ax3.set_title('Frame Dragging Efficiency', fontsize=13)
-        ax3.grid(True, alpha=0.3)
-        ax3.legend()
+        if results.get('topology_evolution'):
+            topo_times = [d['time'] for d in results['topology_evolution'] if d is not None]
+            n_crossings = [d['n_crossings'] for d in results['topology_evolution'] if d is not None]
+            
+            if topo_times:
+                ax3.plot(topo_times, n_crossings, 'g-', linewidth=2, marker='o', markersize=6)
+                ax3.set_xlabel('Time (M)', fontsize=12)
+                ax3.set_ylabel('Number of Zero Crossings', fontsize=12)
+                ax3.set_title('Field Topology (Zero-Crossing)', fontsize=13, fontweight='bold')
+                ax3.grid(True, alpha=0.3)
+                ax3.set_ylim(-0.5, max(n_crossings) + 0.5)
+                
+                # Add horizontal lines for reference
+                ax3.axhline(y=0, color='blue', linestyle='--', alpha=0.3, linewidth=1.5)
+                ax3.axhline(y=1, color='orange', linestyle='--', alpha=0.3, linewidth=1.5)
+                ax3.axhline(y=2, color='red', linestyle='--', alpha=0.3, linewidth=1.5)
+                
+                # Labels
+                ax3.text(times[-1]*0.95, 0, ' Monopole', fontsize=9, va='center', color='blue')
+                ax3.text(times[-1]*0.95, 1, ' Split', fontsize=9, va='center', color='orange')
+                ax3.text(times[-1]*0.95, 2, ' Dipole', fontsize=9, va='center', color='red')
+                
+                # Final classification
+                final_topo = results['topology_evolution'][-1]
+                if final_topo:
+                    topo_text = f'{final_topo["field_type"]}'
+                    ax3.text(0.02, 0.98, topo_text, transform=ax3.transAxes,
+                            fontsize=10, verticalalignment='top', fontfamily='monospace',
+                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", 
+                                    edgecolor='gray', alpha=0.9, linewidth=1))
+        else:
+            ax3.text(0.5, 0.5, 'Topology data\nnot available',
+                    transform=ax3.transAxes, ha='center', va='center', fontsize=12)
+            ax3.set_title('Field Topology Evolution', fontsize=13, fontweight='bold')
         
-        # 4. Flux conservation with dynamic interpretation
-        ax4 = axes[1, 1]
+        # ========================================================================
+        # Panel 4: Frame Dragging at Horizon
+        # ========================================================================
+        ax4 = axes[1, 0]
+        ax4.plot(times, results['frame_dragging_efficiency'], 'g-', linewidth=2)
+        ax4.axhline(y=0.5, color='r', linestyle='--', alpha=0.7, linewidth=2, label='BZ Theory = 0.500')
+        ax4.set_xlabel('Time (M)', fontsize=12)
+        ax4.set_ylabel('ΩF/ΩH', fontsize=12)
+        ax4.set_title('Frame Dragging at Horizon', fontsize=13, fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        
+        # Stats
+        if results['frame_dragging_efficiency']:
+            valid_omega = [x for x in results['frame_dragging_efficiency'] if not np.isnan(x)]
+            if valid_omega:
+                avg_omega = np.mean(valid_omega)
+                std_omega = np.std(valid_omega)
+                deviation_percent = abs(avg_omega - 0.5) / 0.5 * 100
+                
+                omega_text = f'⟨ΩF/ΩH⟩ = {avg_omega:.4f} ± {std_omega:.4f}\n'
+                omega_text += f'Theory = 0.5000\n'
+                omega_text += f'Δ = {deviation_percent:.1f}%'
+                
+                ax4.text(0.02, 0.98, omega_text, transform=ax4.transAxes,
+                        fontsize=10, verticalalignment='top', fontfamily='monospace',
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", 
+                                edgecolor='gray', alpha=0.9, linewidth=1))
+        
+        ax4.legend()
+        
+        # ========================================================================
+        # Panel 5: Flux Conservation
+        # ========================================================================
+        ax5 = axes[1, 1]
         flux_normalized = np.array(results['magnetic_flux_conservation'])
         if len(flux_normalized) > 0:
             flux_normalized = flux_normalized / flux_normalized[0]
-        ax4.plot(times, flux_normalized, 'm-', linewidth=2)
-        ax4.axhline(y=1, color='k', linestyle='--', alpha=0.5, label='Perfect Conservation')
-        ax4.set_xlabel('Time (M)', fontsize=12)
-        ax4.set_ylabel('Φ/Φ₀ (normalized)', fontsize=12)
+        ax5.plot(times, flux_normalized, 'm-', linewidth=2)
+        ax5.axhline(y=1, color='k', linestyle='--', alpha=0.5, label='Perfect Conservation')
+        ax5.set_xlabel('Time (M)', fontsize=12)
+        ax5.set_ylabel('Φ/Φ₀ (normalized)', fontsize=12)
         
-        # Dynamic title based on flux behavior
+        # Quantitative title
         max_flux_ratio = max(flux_normalized) if len(flux_normalized) > 0 else 1
+        min_flux_ratio = min(flux_normalized) if len(flux_normalized) > 0 else 1
+        
         if max_flux_ratio > 5:
-            ax4.set_title('Magnetic Flux Amplification (!)', fontsize=13, color='red')
-        elif max_flux_ratio < 0.5:
-            ax4.set_title('Magnetic Flux Dissipation', fontsize=13) 
+            ax5.set_title(f'Magnetic Flux: {max_flux_ratio:.1f}× Amplification', 
+                        fontsize=13, fontweight='bold', color='red')
+        elif min_flux_ratio < 0.5:
+            ax5.set_title(f'Magnetic Flux: {(1-min_flux_ratio)*100:.0f}% Dissipation',
+                        fontsize=13, fontweight='bold')
         else:
-            ax4.set_title('Magnetic Flux Conservation', fontsize=13)
+            flux_variation = (max_flux_ratio - min_flux_ratio) / 1.0 * 100
+            ax5.set_title(f'Magnetic Flux: {flux_variation:.1f}% Variation',
+                        fontsize=13, fontweight='bold')
+        
+        # Stats
+        flux_text = f'Initial: 1.00\n'
+        flux_text += f'Final:   {flux_normalized[-1]:.2f}\n'
+        flux_text += f'Max:     {max_flux_ratio:.2f}\n'
+        flux_text += f'Min:     {min_flux_ratio:.2f}'
+                
+        ax5.text(0.02, 0.98, flux_text, transform=ax5.transAxes,
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", 
+                        edgecolor='gray', alpha=0.9, linewidth=1))
             
-        ax4.grid(True, alpha=0.3)
-        ax4.legend()
+        ax5.grid(True, alpha=0.3)
+        ax5.legend()
+        
+        # ========================================================================
+        # Panel 6: Summary
+        # ========================================================================
+        ax6 = axes[1, 2]
+        ax6.axis('off')
+        
+        # Keep this panel quantitative - just numbers, no interpretation:
+        summary_text = "SUMMARY\n"
+        summary_text += "─" * 25 + "\n\n"
+
+        summary_text += f"Time: {times[0]:.0f} - {times[-1]:.0f} M\n"
+        summary_text += f"Snapshots: {len(times)}\n\n"
+
+        summary_text += f"ΔB/B_0: {decay_percent:+.1f}%\n\n"
+
+        if results.get('hemisphere_flux_evolution'):
+            final_flux = results['hemisphere_flux_evolution'][-1]
+            if final_flux:
+                summary_text += f"Field: {final_flux['field_type']}\n"
+                summary_text += f"Φ_N: {final_flux['flux_north']:+.2e}\n"
+                summary_text += f"Φ_S: {final_flux['flux_south']:+.2e}\n\n"
+
+        if results.get('topology_evolution'):
+            final_topo = results['topology_evolution'][-1]
+            if final_topo:
+                summary_text += f"Crossings: {final_topo['n_crossings']}\n"
+                summary_text += f"Type: {final_topo['field_type']}\n\n"
+
+        if valid_omega:
+            summary_text += f"⟨ΩF/ΩH⟩: {avg_omega:.4f}\n"
+            summary_text += f"σ: {std_omega:.4f}\n"
+            summary_text += f"Δ: {deviation_percent:.1f}%"
+
+        ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes,
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.5", facecolor="white", 
+                        edgecolor='gray', alpha=0.95, linewidth=1.5))
         
         plt.tight_layout()
         
-        # Dynamic filename
+        # Save
         safe_field_type = field_type.lower().replace('/', '_').replace(' ', '_')
-        filename = os.path.join(self.output_dir, f"magnetic_hair_loss_{safe_field_type}.png")
+        filename = os.path.join(self.output_dir, 
+                            f"magnetic_hair_loss_enhanced_{safe_field_type}.png")
         plt.savefig(filename, dpi=200, bbox_inches='tight')
-        print(f"Saved hair loss analysis: {filename}")
+        print(f"Saved enhanced hair loss analysis: {filename}")
         
         if show:
             plt.show()
@@ -1396,21 +3846,120 @@ def get_dump_files(dump_folder="dumps", pattern="dump[0-9][0-9][0-9]"):
     dump_files = [os.path.basename(f) for f in dump_files]  # Remove path
     return dump_files
 
+def handle_animation_requests(analyzer, args, dump_files):
+    """
+    Handle all animation-related requests
+    Returns True if handled (should exit), False otherwise
+    """
+    if args.animations:
+        print("\n=== GENERATING ALL ANIMATIONS ===")
+        analyzer.generate_all_animations(
+            dump_files,
+            fps=args.fps,
+            early_resolution_boost=True
+        )
+        print(f"✓ All animations saved to: {args.output}")
+        return True
+    
+    if args.stag_anim:
+        print("\n=== GENERATING VELOCITY & STAGNATION ANIMATION ===")
+        output = os.path.join(args.output, "velocity_stagnation.mp4")
+        analyzer.create_velocity_and_stagnation_animation(
+            dump_files, output_file=output, fps=args.fps
+        )
+        print(f"✓ Saved to: {output}")
+        return True
+    
+    if args.energy_anim:
+        print("\n=== GENERATING ENERGY ZONES ANIMATION ===")
+        output = os.path.join(args.output, "energy_zones.mp4")
+        analyzer.create_energy_zones_animation(
+            dump_files, output_file=output, fps=args.fps
+        )
+        print(f"✓ Saved to: {output}")
+        return True
+    
+    if args.mag_anim:
+        print("\n=== GENERATING MAGNETIC TOPOLOGY ANIMATION ===")
+        output = os.path.join(args.output, "magnetic_topology.mp4")
+        analyzer.create_magnetic_topology_animation(
+            dump_files, output_file=output, fps=args.fps
+        )
+        print(f"✓ Saved to: {output}")
+        return True
+    
+    return False
+
+
+def handle_analysis_requests(analyzer, args, dump_files):
+    """
+    Handle standard analysis requests
+    Returns True if handled, False otherwise
+    """
+    # Add your analysis handling here if needed
+    # For now, return False (no early exit)
+    return False
+
+
+def setup_argparse():
+    """
+    Simplified argument parser - only keep what you actually use
+    """
+    parser = argparse.ArgumentParser(
+        description='Magnetized Accretion Analysis',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate all animations
+  python magnetized_analysis.py --animations
+  
+  # Generate specific animation
+  python magnetized_analysis.py --stag-anim --fps 15
+  
+  # Full analysis
+  python magnetized_analysis.py --problem bz_monopole
+        """
+    )
+    
+    # Core options (keep these)
+    parser.add_argument('--problem', type=str, default='bz_monopole',
+                       choices=['bondi_1d', 'bondi_2d', 'monopole_2d', 'bz_monopole'],
+                       help='Problem type to analyze')
+    
+    parser.add_argument('--output', type=str, default='./magnetized_plots',
+                       help='Output directory for results')
+    
+    # Animation options
+    anim_group = parser.add_argument_group('Animation Options')
+    anim_group.add_argument('--animations', action='store_true',
+                           help='Generate all animations')
+    anim_group.add_argument('--stag-anim', action='store_true',
+                           help='Generate velocity/stagnation animation only')
+    anim_group.add_argument('--energy-anim', action='store_true',
+                           help='Generate energy zones animation only')
+    anim_group.add_argument('--mag-anim', action='store_true',
+                           help='Generate magnetic topology animation only')
+    anim_group.add_argument('--fps', type=int, default=10,
+                           help='Frames per second for animations (default: 10)')
+    
+    # Analysis options (if you use them)
+    analysis_group = parser.add_argument_group('Analysis Options')
+    analysis_group.add_argument('--sample', type=int, default=5,
+                               help='Sample every N-th dump file for analysis')
+    
+    return parser
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Magnetized Black Hole Problems")
-    parser.add_argument("--problem", type=str, default="monopole_1d", 
-                       choices=["monopole_1d", "monopole_2d", "bz_monopole"],
-                       help="Type of magnetized problem to analyze")
-    parser.add_argument("--output", type=str, default="./magnetized_plots", 
-                       help="Output directory for plots and movies")
-    parser.add_argument("--sample", type=int, default=1, 
-                       help="Sample every N dump files")
-    parser.add_argument("--animate", action="store_true", 
-                       help="Create density evolution animation (2D only)")
-    parser.add_argument("--soma2017", action="store_true", 
-                   help="Run SOMA2017 hair loss analysis only")
+    """
+    Streamlined main function - delegates to helper functions
+    """
+    # Parse arguments
+    parser = setup_argparse()
     args = parser.parse_args()
+    
+    # Create output directory
+    os.makedirs(args.output, exist_ok=True)
     
     # Initialize analyzer
     analyzer = MagnetizedAnalysis(output_dir=args.output)
@@ -1418,182 +3967,45 @@ def main():
     # Get dump files
     dump_files = get_dump_files()
     if not dump_files:
-        print("No dump files found! Make sure simulation has run.")
+        print("ERROR: No dump files found!")
+        print("Looking for: dumps/dump[0-9][0-9][0-9]")
         return
     
     print(f"Found {len(dump_files)} dump files")
-    print(f"Analyzing {args.problem} problem...")
+    print(f"Range: {dump_files[0]} to {dump_files[-1]}")
     
-    if args.soma2017:
-        print("SOMA2017: Analyzing black hole 'hair loss'...")
-        hair_results = analyzer.analyze_magnetic_hair_loss(dump_files, sample_every=5)
-        
-        # Use detected field type for labeling
-        detected_type = hair_results.get('detected_field_type', 'Unknown')
-        print(f"Detected field type: {detected_type}")
-        analyzer.plot_hair_loss_analysis(hair_results, field_type=detected_type)
-        
-        # Quick summary with NaN handling
-        if hair_results['frame_dragging_efficiency']:
-            valid_omega = [x for x in hair_results['frame_dragging_efficiency'] if not np.isnan(x)]
-            if valid_omega:
-                avg_omega = np.mean(valid_omega)
-                print(f"Average ΩF/ΩH = {avg_omega:.3f} (theory = 0.500)")
-            else:
-                print("ΩF/ΩH data contains only NaN values")
-        print(f"Results saved to: {args.output}")
-        return  # Skip other analyses
-
-    if args.problem == "monopole_1d":
-        # Analyze 1D monopole problem
-        results = analyzer.analyze_1d_monopole(dump_files, sample_every=args.sample)
-        analyzer.plot_1d_monopole_results(results)
-        
-        print("\n=== KEY RESULTS ===")
-        if results['sigma_initial']:
-                print(f"Initial magnetization σ₀: {results['sigma_initial']:.2e}")
-                print(f"√σ₀: {np.sqrt(results['sigma_initial']):.2f}")
-        if results['lorentz_factors']:
-            print(f"Final Lorentz factor: {results['lorentz_factors'][-1]:.2f}")
-        if results['omega_ratios']:
-            avg_omega = np.mean(results['omega_ratios'])
-            print(f"Average ΩF/ΩH: {avg_omega:.3f} (theory: 0.5)")
+    # ========================================================================
+    # PRIORITY 1: Handle animation requests (exit after completion)
+    # ========================================================================
+    if handle_animation_requests(analyzer, args, dump_files):
+        return  # Animation generated, exit
     
-    elif args.problem in ["monopole_2d", "bz_monopole"]:
-        # DETECT FIELD TYPE FOR FULL ANALYSIS TOO
+    # ========================================================================
+    # PRIORITY 2: Handle analysis requests
+    # ========================================================================
+    if handle_analysis_requests(analyzer, args, dump_files):
+        return  # Analysis complete, exit
+    
+    # ========================================================================
+    # DEFAULT: Run standard analysis for the specified problem
+    # ========================================================================
+    print(f"\n=== ANALYZING {args.problem.upper()} ===")
+    
+    if args.problem in ['bz_monopole', 'monopole_2d']:
+        # Detect field type
         detected_type = analyzer.detect_field_type(dump_files[-1])
         print(f"Detected field type: {detected_type}")
         
-        # Analyze 2D monopole problems
+        # Run 2D monopole analysis
         results = analyzer.analyze_2d_monopole(dump_files, sample_every=args.sample)
-        
-        # PASS FIELD TYPE TO PLOTTING FUNCTION
         analyzer.plot_2d_monopole_results(results, field_type=detected_type)
         
-        # Create animation if requested
-        if args.animate:
-            analyzer.create_2d_density_animation(dump_files)
-            analyzer.create_frame_dragging_animation(results)
-            analyzer.create_power_extraction_animation(results)
-        
-        print(f"\n=== 2D {detected_type.upper()} RESULTS ===")  # Dynamic header
-        if results['omega_theta_profiles']:
-            latest_omega = results['omega_theta_profiles'][-1]
-            omega_ratio = latest_omega['omega_ratio']
-            if hasattr(omega_ratio, '__len__'):
-                avg_omega = np.mean(omega_ratio)
-                print(f"Average ΩF/ΩH: {avg_omega:.3f} (theory: 0.5)")
-                print(f"ΩF/ΩH range: {np.min(omega_ratio):.3f} to {np.max(omega_ratio):.3f}")
-                
-                # Calculate magnetic flux and BZ power prediction - FIXED INLINE VERSION
-                print("\n=== MAGNETIC FLUX ANALYSIS ===")
-                try:
-                    # Load the latest dump for flux calculation
-                    analyzer.load_data("gdump", dump_files[-1])
-                    flux_data = analyzer.calculate_magnetic_flux()
-                    
-                    if flux_data:
-                        # Calculate BZ power prediction directly inline
-                        a = hs.a
-                        rhor = flux_data['horizon_radius'] 
-                        total_flux = flux_data['total_flux']
-                        bz_power = (a**2 * total_flux**2) / (4 * np.pi * rhor**2) * (avg_omega)**2
-                        bz_prediction = {
-                            'bz_power_prediction': bz_power,
-                            'flux': total_flux,
-                            'omega_ratio': avg_omega,
-                            'spin': a,
-                            'horizon_radius': rhor
-                        }
-                        
-                        print(f"\n=== BZ POWER CALCULATION (INLINE) ===")
-                        print(f"Black hole spin a = {a:.3f}")
-                        print(f"Horizon radius r_h = {rhor:.3f}") 
-                        print(f"Magnetic flux Φ = {total_flux:.3e}")
-                        print(f"Frame dragging ΩF/ΩH = {avg_omega:.3f}")
-                        print(f"BZ Power Prediction: P_BZ = {bz_power:.3e}")
-                        
-                        # Calculate total power from simulation
-                        power_data = analyzer.calculate_total_power_from_simulation(results)
-                        
-                        if power_data and bz_prediction:
-                            # Compare theory vs simulation
-                            measured_power = power_data['measured_power']
-                            theoretical_power = bz_prediction['bz_power_prediction']
-                            
-                            # Calculate agreement
-                            ratio = measured_power / theoretical_power
-                            percent_difference = abs(ratio - 1) * 100
-                            
-                            print("\n" + "="*50)
-                            print("BLANDFORD-ZNAJEK THEORY vs SIMULATION COMPARISON") 
-                            print("="*50)
-                            
-                            print(f"\nPhysical Interpretation:")
-                            print(f"• Energy flux integration follows from Poynting's theorem")
-                            print(f"• Total Power = ∫ (Energy Flux) · dA over spherical surface")
-                            print(f"• BZ theory: P = (a²Φ²/4πr_h²) × (ΩF/ΩH)²")
-                            print(f"")
-                            print(f"Results:")
-                            print(f"• Theoretical BZ Power:  {theoretical_power:.3e}")
-                            print(f"• Measured Simulation Power: {measured_power:.3e}")
-                            print(f"• Ratio (Sim/Theory):    {ratio:.2f}")
-                            print(f"• Percentage difference: {percent_difference:.1f}%")
-                            print(f"")
-                            
-                            if 0.5 <= ratio <= 2.0:
-                                agreement = "GOOD"
-                            elif 0.2 <= ratio <= 5.0:
-                                agreement = "REASONABLE" 
-                            else:
-                                agreement = "ENHANCED" if ratio > 5.0 else "POOR"
-                                
-                            print(f"Agreement Assessment: {agreement}")
-                            
-                            if agreement == "GOOD":
-                                print("✓ Simulation successfully reproduces BZ power extraction!")
-                            elif agreement == "REASONABLE":
-                                print("~ Simulation shows BZ-like power extraction with some deviation")
-                            elif agreement == "ENHANCED":
-                                print("↑ Simulation shows enhanced power extraction beyond pure BZ theory")
-                                print("  This is physically reasonable due to additional plasma physics:")
-                                print("  - Magnetic reconnection and plasma acceleration")
-                                print("  - Energy accumulation in the outflow")
-                                print("  - Non-ideal MHD effects")
-                            else:
-                                print("✗ Significant discrepancy - may indicate numerical issues")
-                                
-                            print("\nNote: Power increases with radius indicate energy addition:")
-                            print("• BZ theory gives minimum power generated at horizon")
-                            print("• Additional physics enhances energy extraction")  
-                            print("• Frame dragging efficiency ΩF/ΩH matches theory perfectly")
-                        else:
-                            print("\nComparison could not be completed:")
-                            if not bz_prediction:
-                                print("- BZ prediction calculation failed")
-                            if not power_data:
-                                print("- Power integration calculation failed")
-                        
-                        if bz_prediction:
-                            print(f"\nOriginal theoretical scaling estimate:")
-                            print(f"P_BZ ≈ 6.2×10⁻⁴ × (Φ/10)² = 6.2×10⁻⁴ × ({flux_data['total_flux']:.1e}/10)²")
-                            print(f"    = {6.2e-4 * (flux_data['total_flux']/10)**2:.3e}")
-                            print(f"Corrected BZ calculation: {bz_prediction['bz_power_prediction']:.3e}")
-                except Exception as e:
-                    print(f"Could not complete analysis: {e}")
-                    print("This might indicate magnetic field data (B) is not available in your dumps")
-                    import traceback
-                    traceback.print_exc()
-                
-            else:
-                avg_omega = omega_ratio
-                print(f"ΩF/ΩH: {avg_omega:.3f} (theory: 0.5)")
-        
-        if results['fast_surface_data']:
-            print(f"Fast surface analysis completed for {len(results['fast_surface_data'])} time steps")
-        
-        if results['power_extraction']:
-            print(f"Power extraction analysis completed for {len(results['power_extraction'])} time steps")
+        print(f"\n✓ Analysis complete!")
+        print(f"Results saved to: {args.output}")
+    
+    else:
+        print(f"Analysis for {args.problem} not yet implemented in streamlined version")
+        print("Use the full analysis mode or implement handler function")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+"""
+Complete Torus Problem Analysis Script for HARM Simulations
+Based on SOMA2017 exercises - analyzing MRI, accretion, and magnetized dynamics
+"""
+
+import harm_script as hs
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import numpy as np
+import os
+import argparse
+from matplotlib.colors import LogNorm, Normalize
+from matplotlib.gridspec import GridSpec
+import glob
+
+
+class TorusAnalysis:
+    """Class for analyzing magnetized torus problems"""
+    
+    def __init__(self, output_dir="./torus_analysis"):
+        self.output_dir = output_dir
+        self.cache = {}
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+    
+    def load_data(self, grid_file, dump_file):
+        """Load grid and simulation data with caching"""
+        if "grid" not in self.cache:
+            hs.rg(grid_file)
+            self.cache["grid"] = True
+            print(f"Loaded grid from {grid_file}.")
+        hs.rd(dump_file)
+        print(f"Loaded data from {dump_file}, time: {hs.t:.6f}")
+        return hs.t
+    
+    def analyze_mri_resolution(self, dump_file="dump000"):
+        """
+        Analyze MRI wavelength resolution in initial conditions
+        Good resolution: ≥15 cells per wavelength, acceptable: 5-10 cells
+        """
+        print("=== MRI RESOLUTION ANALYSIS ===")
+        
+        self.load_data("gdump", dump_file)
+        
+        # Calculate MRI wavelength resolution using harm_script function
+        if hasattr(hs, 'Qmri'):
+            # Check resolution in theta direction (dir=2)
+            Q_theta = hs.Qmri(dir=2)
+            print(f"MRI resolution in θ-direction: {Q_theta.mean():.1f} cells/wavelength")
+            print(f"Minimum resolution: {Q_theta.min():.1f} cells/wavelength")
+            print(f"Maximum resolution: {Q_theta.max():.1f} cells/wavelength")
+            
+            # Check resolution in radial direction (dir=1) if available
+            try:
+                Q_radial = hs.Qmri(dir=1)
+                print(f"MRI resolution in r-direction: {Q_radial.mean():.1f} cells/wavelength")
+            except:
+                print("Radial MRI resolution not available")
+            
+            # Assessment
+            avg_resolution = Q_theta.mean()
+            if avg_resolution >= 15:
+                assessment = "EXCELLENT"
+                color = "green"
+            elif avg_resolution >= 10:
+                assessment = "GOOD"
+                color = "orange"
+            elif avg_resolution >= 5:
+                assessment = "ACCEPTABLE"
+                color = "yellow"
+            else:
+                assessment = "POOR - MRI may not develop properly"
+                color = "red"
+            
+            print(f"Resolution Assessment: {assessment}")
+            
+            return {
+                'Q_theta': Q_theta,
+                'Q_radial': Q_radial if 'Q_radial' in locals() else None,
+                'avg_resolution': avg_resolution,
+                'assessment': assessment
+            }
+        else:
+            print("MRI resolution function not available")
+            return None
+    
+    def analyze_time_evolution(self, dump_files, sample_every=5):
+        """Analyze time evolution to identify quasi-stationary regime"""
+        print("=== TIME EVOLUTION ANALYSIS ===")
+        
+        results = {
+            'times': [],
+            'mdot_inner': [],  # Mass accretion rate near inner edge
+            'magnetic_energy': [],
+            'kinetic_energy': [],
+            'density_center': [],  # Density in central region
+            'quasi_stationary_start': None
+        }
+        
+        for dump_file in dump_files[::sample_every]:
+            try:
+                current_time = self.load_data("gdump", dump_file)
+                
+                # Get 2D data
+                r_2d = hs.r.squeeze()
+                rho_2d = hs.rho.squeeze()
+                
+                # Mass accretion rate estimation (simplified)
+                # Look at density in inner region (r < 10)
+                inner_mask = r_2d < 10
+                mdot_proxy = np.mean(rho_2d[inner_mask]) if np.any(inner_mask) else 0
+                
+                # Magnetic energy
+                if hasattr(hs, 'bsq'):
+                    magnetic_energy = np.mean(hs.bsq.squeeze())
+                else:
+                    magnetic_energy = 0
+                
+                # Kinetic energy (rough estimate)
+                if hasattr(hs, 'uu'):
+                    kinetic_energy = np.mean(hs.uu[0].squeeze())
+                else:
+                    kinetic_energy = 0
+                
+                # Central density (as indicator of torus evolution)
+                center_idx = len(r_2d) // 3  # Inner third of domain
+                density_center = np.mean(rho_2d[:center_idx, :])
+                
+                results['times'].append(current_time)
+                results['mdot_inner'].append(mdot_proxy)
+                results['magnetic_energy'].append(magnetic_energy)
+                results['kinetic_energy'].append(kinetic_energy)
+                results['density_center'].append(density_center)
+                
+                print(f"t={current_time:.1f}: ρ_center={density_center:.3e}, B²={magnetic_energy:.3e}")
+                
+            except Exception as e:
+                print(f"Error processing {dump_file}: {e}")
+                continue
+        
+        # Identify quasi-stationary regime
+        if len(results['times']) > 10:
+            # Look for when magnetic energy stabilizes
+            mag_energy = np.array(results['magnetic_energy'])
+            times = np.array(results['times'])
+            
+            # Simple criterion: when magnetic energy stops growing rapidly
+            if len(mag_energy) > 20:
+                growth_rate = np.gradient(mag_energy, times)
+                # Find when growth rate becomes small
+                stable_indices = np.where(np.abs(growth_rate) < 0.1 * np.max(np.abs(growth_rate)))[0]
+                if len(stable_indices) > 0:
+                    quasi_start_idx = stable_indices[len(stable_indices)//3]  # Take later stable period
+                    results['quasi_stationary_start'] = times[quasi_start_idx]
+                    print(f"Quasi-stationary regime estimated to start at t ≈ {results['quasi_stationary_start']:.1f}")
+        
+        return results
+    
+    def calculate_alpha_parameter(self, dump_files, quasi_start_time=None, sample_every=3):
+        """
+        Calculate local alpha parameter α = T^r_φ/P
+        Following Penna et al. (2013) methodology
+        """
+        print("=== ALPHA PARAMETER ANALYSIS ===")
+        
+        if quasi_start_time is None:
+            print("No quasi-stationary time provided, using all data")
+            quasi_files = dump_files
+        else:
+            # Filter files to quasi-stationary period
+            quasi_files = []
+            for dump_file in dump_files:
+                try:
+                    self.load_data("gdump", dump_file)
+                    if hs.t >= quasi_start_time:
+                        quasi_files.append(dump_file)
+                except:
+                    continue
+            print(f"Using {len(quasi_files)} files from quasi-stationary period")
+        
+        # Time-averaged quantities
+        alpha_total_sum = None
+        alpha_magnetic_sum = None
+        alpha_reynolds_sum = None
+        pressure_sum = None
+        count = 0
+        
+        for dump_file in quasi_files[::sample_every]:
+            try:
+                self.load_data("gdump", dump_file)
+                
+                # Calculate auxiliary quantities (stress tensor, etc.)
+                hs.aux()  # This computes Tud and other stress tensor components
+                
+                if not hasattr(hs, 'Tud'):
+                    print("Stress tensor not available, skipping alpha calculation")
+                    continue
+                
+                # Get stress tensor components
+                T_r_phi = hs.Tud[1, 3].squeeze()  # T^r_φ component
+                
+                # Get pressure
+                pg = (hs.gam - 1) * hs.ug.squeeze()  # Gas pressure
+                
+                # Calculate alpha = T^r_φ / P
+                alpha_total = T_r_phi / (pg + 1e-20)  # Add small number to avoid division by zero
+                
+                # Separate magnetic and Reynolds contributions
+                if hasattr(hs, 'TudEM') and hasattr(hs, 'TudMA'):
+                    T_r_phi_magnetic = hs.TudEM[1, 3].squeeze()
+                    T_r_phi_reynolds = hs.TudMA[1, 3].squeeze()
+                    
+                    alpha_magnetic = T_r_phi_magnetic / (pg + 1e-20)
+                    alpha_reynolds = T_r_phi_reynolds / (pg + 1e-20)
+                else:
+                    # Rough estimates if separated components not available
+                    magnetic_fraction = hs.bsq.squeeze() / (hs.rho.squeeze() + hs.bsq.squeeze() + 1e-20)
+                    alpha_magnetic = alpha_total * magnetic_fraction
+                    alpha_reynolds = alpha_total * (1 - magnetic_fraction)
+                
+                # Time averaging
+                if alpha_total_sum is None:
+                    alpha_total_sum = alpha_total.copy()
+                    alpha_magnetic_sum = alpha_magnetic.copy()
+                    alpha_reynolds_sum = alpha_reynolds.copy()
+                    pressure_sum = pg.copy()
+                else:
+                    alpha_total_sum += alpha_total
+                    alpha_magnetic_sum += alpha_magnetic
+                    alpha_reynolds_sum += alpha_reynolds
+                    pressure_sum += pg
+                
+                count += 1
+                
+                print(f"Processed t={hs.t:.1f} for alpha calculation")
+                
+            except Exception as e:
+                print(f"Error in alpha calculation for {dump_file}: {e}")
+                continue
+        
+        if count > 0:
+            # Time-averaged alpha parameters
+            alpha_total_avg = alpha_total_sum / count
+            alpha_magnetic_avg = alpha_magnetic_sum / count
+            alpha_reynolds_avg = alpha_reynolds_sum / count
+            pressure_avg = pressure_sum / count
+            
+            results = {
+                'alpha_total': alpha_total_avg,
+                'alpha_magnetic': alpha_magnetic_avg,
+                'alpha_reynolds': alpha_reynolds_avg,
+                'pressure': pressure_avg,
+                'count': count,
+                'r_grid': hs.r.squeeze(),
+                'theta_grid': hs.h.squeeze()
+            }
+            
+            print(f"Alpha parameter calculated from {count} snapshots")
+            print(f"Typical α_total: {np.nanmean(alpha_total_avg):.3f}")
+            print(f"Typical α_magnetic: {np.nanmean(alpha_magnetic_avg):.3f}")
+            print(f"Typical α_reynolds: {np.nanmean(alpha_reynolds_avg):.3f}")
+            
+            return results
+        else:
+            print("No valid data for alpha calculation")
+            return None
+    
+    def analyze_angular_velocity(self, dump_files, quasi_start_time=None, sample_every=5):
+        """
+        Analyze angular velocity Ω = u^φ/u^t and compare to Keplerian
+        """
+        print("=== ANGULAR VELOCITY ANALYSIS ===")
+        
+        if quasi_start_time is None:
+            analysis_files = dump_files
+        else:
+            analysis_files = []
+            for dump_file in dump_files:
+                try:
+                    self.load_data("gdump", dump_file)
+                    if hs.t >= quasi_start_time:
+                        analysis_files.append(dump_file)
+                except:
+                    continue
+        
+        omega_sum = None
+        omega_keplerian_sum = None
+        count = 0
+        
+        for dump_file in analysis_files[::sample_every]:
+            try:
+                self.load_data("gdump", dump_file)
+                
+                # Calculate Ω = u^φ/u^t
+                if hasattr(hs, 'uu'):
+                    u_phi = hs.uu[3].squeeze()
+                    u_t = hs.uu[0].squeeze()
+                    omega = u_phi / (u_t + 1e-20)
+                else:
+                    print("4-velocity not available")
+                    continue
+                
+                # Keplerian angular velocity: Ω_K = 1/(r^(3/2) + a)
+                r_2d = hs.r.squeeze()
+                a = hs.a  # Black hole spin
+                omega_keplerian = 1.0 / (r_2d**(1.5) + a)
+                
+                # Time averaging
+                if omega_sum is None:
+                    omega_sum = omega.copy()
+                    omega_keplerian_sum = omega_keplerian.copy()
+                else:
+                    omega_sum += omega
+                    omega_keplerian_sum += omega_keplerian
+                
+                count += 1
+                
+            except Exception as e:
+                print(f"Error in omega calculation for {dump_file}: {e}")
+                continue
+        
+        if count > 0:
+            omega_avg = omega_sum / count
+            omega_keplerian_avg = omega_keplerian_sum / count
+            
+            results = {
+                'omega': omega_avg,
+                'omega_keplerian': omega_keplerian_avg,
+                'omega_ratio': omega_avg / (omega_keplerian_avg + 1e-20),
+                'r_grid': hs.r.squeeze(),
+                'theta_grid': hs.h.squeeze(),
+                'count': count
+            }
+            
+            print(f"Angular velocity analyzed from {count} snapshots")
+            
+            return results
+        else:
+            return None
+    
+    def find_sonic_surfaces(self, dump_file):
+        """Find sonic and magnetosonic surfaces in the torus"""
+        print("=== SONIC SURFACE ANALYSIS ===")
+        
+        self.load_data("gdump", dump_file)
+        
+        surfaces = {}
+        
+        # Sound speed
+        if hasattr(hs, 'pg') or hasattr(hs, 'ug'):
+            if hasattr(hs, 'pg'):
+                cs2 = hs.gam * hs.pg / hs.rho  # pg already available
+            else:
+                pg = (hs.gam - 1) * hs.ug
+                cs2 = hs.gam * pg / hs.rho
+            
+            cs = np.sqrt(cs2.squeeze())
+            surfaces['sound_speed'] = cs
+        
+        # Alfven speed
+        if hasattr(hs, 'bsq') and hasattr(hs, 'rho'):
+            va2 = hs.bsq / hs.rho
+            va = np.sqrt(va2.squeeze())
+            surfaces['alfven_speed'] = va
+            
+            # Fast magnetosonic speed (approximate)
+            if 'sound_speed' in surfaces:
+                cf2 = cs2 + va2  # Simplified fast speed
+                cf = np.sqrt(cf2.squeeze())
+                surfaces['fast_magnetosonic_speed'] = cf
+        
+        # Velocity magnitude
+        if hasattr(hs, 'uu'):
+            v2 = hs.uu[1]**2 + hs.uu[2]**2 + hs.uu[3]**2  # Spatial components
+            v = np.sqrt(v2.squeeze())
+            surfaces['velocity'] = v
+        
+        print("Calculated characteristic speeds for sonic surface analysis")
+        return surfaces
+    
+    def create_density_movie(self, dump_files, output_file="torus_density_evolution.mp4", fps=10):
+        """Create movie of density evolution with magnetic field lines"""
+        print(f"Creating torus density movie with {len(dump_files)} frames...")
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Sample files for reasonable movie length
+        sampled_files = dump_files[::max(1, len(dump_files)//200)]  # Max 200 frames
+        print(f"Using {len(sampled_files)} frames for movie")
+        
+        # Find global density range
+        global_rho_min, global_rho_max = float('inf'), float('-inf')
+        
+        print("Computing global density range...")
+        for dump_file in sampled_files[::10]:  # Sample for range
+            try:
+                self.load_data("gdump", dump_file)
+                rho = hs.rho.squeeze()
+                positive_rho = rho[rho > 0]
+                if len(positive_rho) > 0:
+                    global_rho_min = min(global_rho_min, positive_rho.min())
+                    global_rho_max = max(global_rho_max, positive_rho.max())
+            except:
+                continue
+        
+        print(f"Density range: {global_rho_min:.2e} to {global_rho_max:.2e}")
+        
+        def update(frame):
+            ax.clear()
+            dump_file = sampled_files[frame]
+            self.load_data("gdump", dump_file)
+            
+            # Get data
+            rho = hs.rho.squeeze()
+            r = hs.r.squeeze()
+            h = hs.h.squeeze()
+            
+            # Convert to Cartesian for visualization
+            x = r * np.sin(h)
+            z = r * np.cos(h)
+            
+            # Plot density
+            im = ax.pcolormesh(x, z, rho, cmap='viridis', 
+                              norm=LogNorm(vmin=global_rho_min, vmax=global_rho_max),
+                              shading='auto')
+            
+            # Overplot magnetic field lines if available
+            if hasattr(hs, 'B'):
+                # Calculate vector potential for field lines
+                try:
+                    aphi = hs.psicalc()  # Magnetic flux function
+                    # Plot field lines
+                    ax.contour(x, z, aphi, levels=20, colors='white', alpha=0.7, linewidths=0.8)
+                except:
+                    pass  # Skip if field line calculation fails
+            
+            # Add black hole
+            rhor = 1 + (1 - hs.a**2)**0.5
+            circle = plt.Circle((0, 0), rhor, color='black', alpha=1.0)
+            ax.add_patch(circle)
+            
+            ax.set_xlabel('X (r_g)')
+            ax.set_ylabel('Z (r_g)')
+            ax.set_title(f'Torus Evolution: Density + B-field (t = {hs.t:.1f})')
+            ax.set_xlim(-50, 50)
+            ax.set_ylim(-50, 50)
+            ax.set_aspect('equal')
+            
+            return im,
+        
+        # Create colorbar
+        self.load_data("gdump", sampled_files[0])
+        rho = hs.rho.squeeze()
+        r = hs.r.squeeze()
+        h = hs.h.squeeze()
+        x = r * np.sin(h)
+        z = r * np.cos(h)
+        
+        im = ax.pcolormesh(x, z, rho, cmap='viridis',
+                          norm=LogNorm(vmin=global_rho_min, vmax=global_rho_max))
+        cbar = fig.colorbar(im, ax=ax, label='Density (log scale)')
+        
+        ani = animation.FuncAnimation(fig, update, frames=len(sampled_files),
+                                     blit=False, interval=100, repeat=True)
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        try:
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"Saved torus density movie: {output_path}")
+        except Exception as e:
+            print(f"Error saving movie: {e}")
+        
+        plt.close(fig)
+    
+    def plot_comprehensive_analysis(self, evolution_results, alpha_results, omega_results, 
+                                   mri_results, show=True):
+        """Create comprehensive analysis plots"""
+        
+        fig = plt.figure(figsize=(18, 12))
+        gs = GridSpec(3, 3, figure=fig, hspace=0.35, wspace=0.25)
+        
+        fig.suptitle('Magnetized Torus Analysis: MRI, Accretion & Turbulence', 
+                    fontsize=18, fontweight='bold')
+        
+        # 1. Time evolution
+        ax1 = fig.add_subplot(gs[0, 0])
+        if evolution_results and evolution_results['times']:
+            times = evolution_results['times']
+            ax1.semilogy(times, evolution_results['magnetic_energy'], 'r-', linewidth=2, label='Magnetic')
+            ax1.semilogy(times, evolution_results['kinetic_energy'], 'b-', linewidth=2, label='Kinetic')
+            
+            if evolution_results['quasi_stationary_start']:
+                ax1.axvline(evolution_results['quasi_stationary_start'], 
+                           color='green', linestyle='--', alpha=0.7, label='Quasi-stationary')
+            
+            ax1.set_xlabel('Time')
+            ax1.set_ylabel('Energy')
+            ax1.set_title('Energy Evolution')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+        
+        # 2. MRI Resolution
+        ax2 = fig.add_subplot(gs[0, 1])
+        if mri_results:
+            Q_theta = mri_results['Q_theta']
+            r_2d = hs.r.squeeze() if hasattr(hs, 'r') else None
+            
+            if r_2d is not None and Q_theta is not None:
+                # Plot resolution vs radius (averaged over theta)
+                if Q_theta.ndim > 1:
+                    Q_avg = Q_theta.mean(axis=1)
+                    r_1d = r_2d[:, 0] if r_2d.ndim > 1 else r_2d
+                else:
+                    Q_avg = Q_theta
+                    r_1d = np.arange(len(Q_avg))
+                
+                ax2.plot(r_1d, Q_avg, 'g-', linewidth=3)
+                ax2.axhline(y=15, color='green', linestyle='--', alpha=0.7, label='Excellent (≥15)')
+                ax2.axhline(y=10, color='orange', linestyle='--', alpha=0.7, label='Good (≥10)')
+                ax2.axhline(y=5, color='red', linestyle='--', alpha=0.7, label='Minimum (≥5)')
+                
+                ax2.set_xlabel('Radius')
+                ax2.set_ylabel('Cells per MRI wavelength')
+                ax2.set_title(f'MRI Resolution ({mri_results["assessment"]})')
+                ax2.legend()
+                ax2.grid(True, alpha=0.3)
+        
+        # 3. Alpha parameter map
+        ax3 = fig.add_subplot(gs[0, 2])
+        if alpha_results:
+            alpha_total = alpha_results['alpha_total']
+            r_grid = alpha_results['r_grid']
+            theta_grid = alpha_results['theta_grid']
+            
+            # Convert to Cartesian for plotting
+            x = r_grid * np.sin(theta_grid)
+            z = r_grid * np.cos(theta_grid)
+            
+            # Plot alpha parameter
+            im = ax3.pcolormesh(x, z, alpha_total, cmap='RdBu_r', 
+                               vmin=-0.1, vmax=0.1, shading='auto')
+            cbar3 = plt.colorbar(im, ax=ax3, label='α_total')
+            
+            ax3.set_xlabel('X')
+            ax3.set_ylabel('Z')
+            ax3.set_title('Alpha Parameter Map')
+            ax3.set_aspect('equal')
+        
+        # 4. Mass accretion rate evolution
+        ax4 = fig.add_subplot(gs[1, 0])
+        if evolution_results and evolution_results['times']:
+            ax4.plot(evolution_results['times'], evolution_results['mdot_inner'], 'purple', linewidth=2)
+            ax4.set_xlabel('Time')
+            ax4.set_ylabel('Mass Accretion Rate (proxy)')
+            ax4.set_title('Accretion Rate Evolution')
+            ax4.grid(True, alpha=0.3)
+        
+        # 5. Alpha components comparison
+        ax5 = fig.add_subplot(gs[1, 1])
+        if alpha_results:
+            alpha_total = alpha_results['alpha_total']
+            alpha_magnetic = alpha_results['alpha_magnetic']
+            alpha_reynolds = alpha_results['alpha_reynolds']
+            
+            # Radial profiles (theta-averaged)
+            if alpha_total.ndim > 1:
+                r_1d = alpha_results['r_grid'][:, 0] if alpha_results['r_grid'].ndim > 1 else alpha_results['r_grid']
+                alpha_tot_avg = alpha_total.mean(axis=1)
+                alpha_mag_avg = alpha_magnetic.mean(axis=1)
+                alpha_rey_avg = alpha_reynolds.mean(axis=1)
+            else:
+                r_1d = np.arange(len(alpha_total))
+                alpha_tot_avg = alpha_total
+                alpha_mag_avg = alpha_magnetic
+                alpha_rey_avg = alpha_reynolds
+            
+            ax5.semilogx(r_1d, alpha_tot_avg, 'k-', linewidth=3, label='Total')
+            ax5.semilogx(r_1d, alpha_mag_avg, 'r-', linewidth=2, label='Magnetic')
+            ax5.semilogx(r_1d, alpha_rey_avg, 'b-', linewidth=2, label='Reynolds')
+            
+            ax5.set_xlabel('Radius')
+            ax5.set_ylabel('Alpha Parameter')
+            ax5.set_title('Alpha Components vs Radius')
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+        
+        # 6. Angular velocity comparison
+        ax6 = fig.add_subplot(gs[1, 2])
+        if omega_results:
+            omega = omega_results['omega']
+            omega_kep = omega_results['omega_keplerian']
+            r_grid = omega_results['r_grid']
+            
+            # Theta-averaged profiles
+            if omega.ndim > 1:
+                r_1d = r_grid[:, 0] if r_grid.ndim > 1 else r_grid
+                omega_avg = omega.mean(axis=1)
+                omega_kep_avg = omega_kep.mean(axis=1)
+            else:
+                r_1d = np.arange(len(omega))
+                omega_avg = omega
+                omega_kep_avg = omega_kep
+            
+            ax6.loglog(r_1d, np.abs(omega_avg), 'b-', linewidth=3, label='Simulation Ω')
+            ax6.loglog(r_1d, omega_kep_avg, 'r--', linewidth=2, label='Keplerian Ω_K')
+            
+            ax6.set_xlabel('Radius')
+            ax6.set_ylabel('Angular Velocity')
+            ax6.set_title('Ω vs Ω_Keplerian')
+            ax6.legend()
+            ax6.grid(True, alpha=0.3)
+        
+        # 7. Density snapshot (equatorial slice)
+        ax7 = fig.add_subplot(gs[2, 0])
+        if hasattr(hs, 'rho') and hasattr(hs, 'r'):
+            rho = hs.rho.squeeze()
+            r_grid = hs.r.squeeze()
+            
+            if rho.ndim > 1:
+                # Take equatorial slice
+                eq_idx = rho.shape[1] // 2
+                rho_eq = rho[:, eq_idx]
+                r_eq = r_grid[:, 0] if r_grid.ndim > 1 else r_grid
+            else:
+                rho_eq = rho
+                r_eq = r_grid
+            
+            ax7.loglog(r_eq, rho_eq, 'g-', linewidth=3)
+            ax7.set_xlabel('Radius')
+            ax7.set_ylabel('Density (equatorial)')
+            ax7.set_title('Radial Density Profile')
+            ax7.grid(True, alpha=0.3)
+        
+        # 8. Summary statistics
+        ax8 = fig.add_subplot(gs[2, 1:])
+        ax8.axis('off')
+        
+        summary_text = "TORUS ANALYSIS SUMMARY\n\n"
+        
+        if mri_results:
+            summary_text += f"MRI Resolution: {mri_results['avg_resolution']:.1f} cells/wavelength ({mri_results['assessment']})\n"
+        
+        if alpha_results:
+            alpha_mean = np.nanmean(alpha_results['alpha_total'])
+            alpha_mag_mean = np.nanmean(alpha_results['alpha_magnetic'])
+            alpha_rey_mean = np.nanmean(alpha_results['alpha_reynolds'])
+            summary_text += f"Alpha Parameter: α_total = {alpha_mean:.3f}\n"
+            summary_text += f"  α_magnetic = {alpha_mag_mean:.3f}\n"
+            summary_text += f"  α_reynolds = {alpha_rey_mean:.3f}\n"
+        
+        if evolution_results and evolution_results['quasi_stationary_start']:
+            summary_text += f"Quasi-stationary regime starts: t ≈ {evolution_results['quasi_stationary_start']:.1f}\n"
+        
+        if omega_results:
+            omega_ratio_mean = np.nanmean(omega_results['omega_ratio'])
+            summary_text += f"Ω/Ω_K ratio: {omega_ratio_mean:.2f}\n"
+        
+        summary_text += f"\nPhysical Interpretation:\n"
+        summary_text += f"• MRI drives turbulent accretion\n"
+        summary_text += f"• Alpha parameter quantifies viscosity\n"
+        summary_text += f"• Magnetic stresses dominate transport\n"
+        summary_text += f"• Angular momentum redistribution occurs"
+        
+        ax8.text(0.05, 0.95, summary_text, transform=ax8.transAxes, 
+                fontsize=11, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.9))
+        
+        # Save figure
+        filename = os.path.join(self.output_dir, "torus_comprehensive_analysis.png")
+        plt.savefig(filename, dpi=200, bbox_inches='tight')
+        print(f"Saved comprehensive analysis: {filename}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
+    
+    def analyze_vertical_alpha(self, dump_files, quasi_start_time=None, sample_every=3):
+        """
+        Calculate vertical alpha parameter α_z = T^z_φ/P
+        Compare with radial α_r for stress anisotropy
+        """
+        print("=== VERTICAL ALPHA PARAMETER ANALYSIS ===")
+        
+        if quasi_start_time is None:
+            analysis_files = dump_files
+        else:
+            analysis_files = []
+            for dump_file in dump_files:
+                try:
+                    self.load_data("gdump", dump_file)
+                    if hs.t >= quasi_start_time:
+                        analysis_files.append(dump_file)
+                except:
+                    continue
+        
+        alpha_z_sum = None
+        alpha_r_sum = None
+        count = 0
+        
+        for dump_file in analysis_files[::sample_every]:
+            try:
+                self.load_data("gdump", dump_file)
+                hs.aux()  # Calculate stress tensor
+                
+                if not hasattr(hs, 'Tud'):
+                    continue
+                
+                # Stress tensor components
+                T_z_phi = hs.Tud[2, 3].squeeze()  # T^θ_φ (vertical stress)
+                T_r_phi = hs.Tud[1, 3].squeeze()  # T^r_φ (radial stress)
+                
+                # Pressure
+                pg = (hs.gam - 1) * hs.ug.squeeze()
+                
+                # Alpha parameters
+                alpha_z = T_z_phi / (pg + 1e-20)
+                alpha_r = T_r_phi / (pg + 1e-20)
+                
+                # Time averaging
+                if alpha_z_sum is None:
+                    alpha_z_sum = alpha_z.copy()
+                    alpha_r_sum = alpha_r.copy()
+                else:
+                    alpha_z_sum += alpha_z
+                    alpha_r_sum += alpha_r
+                
+                count += 1
+                
+            except Exception as e:
+                print(f"Error in vertical alpha calculation: {e}")
+                continue
+        
+        if count > 0:
+            alpha_z_avg = alpha_z_sum / count
+            alpha_r_avg = alpha_r_sum / count
+            
+            results = {
+                'alpha_z': alpha_z_avg,
+                'alpha_r': alpha_r_avg,
+                'alpha_ratio': alpha_z_avg / (alpha_r_avg + 1e-20),
+                'count': count
+            }
+            
+            print(f"Vertical alpha calculated from {count} snapshots")
+            print(f"Typical α_z: {np.nanmean(alpha_z_avg):.3f}")
+            print(f"Typical α_r: {np.nanmean(alpha_r_avg):.3f}")
+            print(f"Typical α_z/α_r: {np.nanmean(results['alpha_ratio']):.3f}")
+            
+            return results
+        else:
+            return None
+    
+    def create_alpha_evolution_movie(self, dump_files, quasi_start_time=None, 
+                                    output_file="torus_alpha_evolution.mp4", fps=5):
+        """Create movie showing alpha parameter evolution"""
+        print("Creating alpha parameter evolution movie...")
+        
+        if quasi_start_time is None:
+            movie_files = dump_files
+        else:
+            movie_files = []
+            for dump_file in dump_files:
+                try:
+                    self.load_data("gdump", dump_file)
+                    if hs.t >= quasi_start_time:
+                        movie_files.append(dump_file)
+                except:
+                    continue
+        
+        # Sample files for movie
+        sampled_files = movie_files[::max(1, len(movie_files)//100)]
+        print(f"Using {len(sampled_files)} frames for alpha movie")
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        def update(frame):
+            ax1.clear()
+            ax2.clear()
+            
+            dump_file = sampled_files[frame]
+            self.load_data("gdump", dump_file)
+            hs.aux()
+            
+            if not hasattr(hs, 'Tud'):
+                return
+            
+            # Calculate alpha
+            T_r_phi = hs.Tud[1, 3].squeeze()
+            pg = (hs.gam - 1) * hs.ug.squeeze()
+            alpha = T_r_phi / (pg + 1e-20)
+            
+            # Get coordinates
+            r = hs.r.squeeze()
+            h = hs.h.squeeze()
+            x = r * np.sin(h)
+            z = r * np.cos(h)
+            
+            # Plot 1: 2D alpha map
+            im1 = ax1.pcolormesh(x, z, alpha, cmap='RdBu_r', 
+                                vmin=-0.2, vmax=0.2, shading='auto')
+            ax1.set_xlabel('X')
+            ax1.set_ylabel('Z')
+            ax1.set_title(f'Alpha Parameter (t = {hs.t:.1f})')
+            ax1.set_aspect('equal')
+            ax1.set_xlim(-50, 50)
+            ax1.set_ylim(-25, 25)
+            
+            # Plot 2: Radial profile
+            if alpha.ndim > 1:
+                r_1d = r[:, 0] if r.ndim > 1 else r
+                alpha_avg = alpha.mean(axis=1)
+            else:
+                r_1d = r
+                alpha_avg = alpha
+            
+            ax2.semilogx(r_1d, alpha_avg, 'b-', linewidth=3)
+            ax2.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+            ax2.set_xlabel('Radius')
+            ax2.set_ylabel('Alpha Parameter')
+            ax2.set_title('Radial Alpha Profile')
+            ax2.grid(True, alpha=0.3)
+            ax2.set_ylim(-0.2, 0.2)
+            
+            return im1,
+        
+        ani = animation.FuncAnimation(fig, update, frames=len(sampled_files),
+                                     blit=False, interval=200, repeat=True)
+        
+        output_path = os.path.join(self.output_dir, output_file)
+        try:
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"Saved alpha evolution movie: {output_path}")
+        except Exception as e:
+            print(f"Error saving alpha movie: {e}")
+        
+        plt.close(fig)
+
+
+def get_dump_files(dump_folder="dumps", pattern="dump[0-9][0-9][0-9]"):
+    """Get sorted list of dump files"""
+    dump_files = sorted(glob.glob(os.path.join(dump_folder, pattern)))
+    dump_files = [os.path.basename(f) for f in dump_files]
+    return dump_files
+
+
+def main():
+    """Main analysis function for torus problem"""
+    parser = argparse.ArgumentParser(description="Analyze Magnetized Torus Problem")
+    parser.add_argument("--output", type=str, default="./torus_analysis", 
+                       help="Output directory for plots and movies")
+    parser.add_argument("--sample", type=int, default=5, 
+                       help="Sample every N dump files for analysis")
+    parser.add_argument("--movie", action="store_true", 
+                       help="Create density evolution movie")
+    parser.add_argument("--alpha-movie", action="store_true",
+                       help="Create alpha parameter evolution movie")
+    parser.add_argument("--mri-only", action="store_true",
+                       help="Only analyze MRI resolution")
+    args = parser.parse_args()
+    
+    # Initialize analyzer
+    analyzer = TorusAnalysis(output_dir=args.output)
+    
+    # Get dump files
+    dump_files = get_dump_files()
+    if not dump_files:
+        print("No dump files found! Make sure torus simulation has run.")
+        return
+    
+    print(f"Found {len(dump_files)} dump files")
+    print("Analyzing magnetized torus problem...")
+    
+    # 1. MRI Resolution Analysis (from initial conditions)
+    print("\n" + "="*50)
+    print("STEP 1: MRI RESOLUTION ANALYSIS")
+    print("="*50)
+    mri_results = analyzer.analyze_mri_resolution()
+    
+    if args.mri_only:
+        print("MRI resolution analysis complete.")
+        return
+    
+    # 2. Time Evolution Analysis
+    print("\n" + "="*50)
+    print("STEP 2: TIME EVOLUTION & QUASI-STATIONARY IDENTIFICATION")
+    print("="*50)
+    evolution_results = analyzer.analyze_time_evolution(dump_files, sample_every=args.sample)
+    
+    quasi_time = evolution_results.get('quasi_stationary_start', None)
+    if quasi_time:
+        print(f"Using quasi-stationary period starting at t = {quasi_time:.1f}")
+    else:
+        print("No clear quasi-stationary period identified, using all data")
+    
+    # 3. Alpha Parameter Analysis
+    print("\n" + "="*50)
+    print("STEP 3: ALPHA PARAMETER ANALYSIS")
+    print("="*50)
+    alpha_results = analyzer.calculate_alpha_parameter(dump_files, quasi_time, sample_every=args.sample)
+    
+    # 4. Angular Velocity Analysis
+    print("\n" + "="*50)
+    print("STEP 4: ANGULAR VELOCITY ANALYSIS")
+    print("="*50)
+    omega_results = analyzer.analyze_angular_velocity(dump_files, quasi_time, sample_every=args.sample)
+    
+    # 5. Vertical Alpha Analysis
+    print("\n" + "="*50)
+    print("STEP 5: VERTICAL ALPHA PARAMETER")
+    print("="*50)
+    vertical_alpha_results = analyzer.analyze_vertical_alpha(dump_files, quasi_time, sample_every=args.sample)
+    
+    # 6. Sonic Surface Analysis (final snapshot)
+    print("\n" + "="*50)
+    print("STEP 6: SONIC SURFACE ANALYSIS")
+    print("="*50)
+    sonic_results = analyzer.find_sonic_surfaces(dump_files[-1])
+    
+    # 7. Create comprehensive plots
+    print("\n" + "="*50)
+    print("STEP 7: CREATING COMPREHENSIVE ANALYSIS PLOTS")
+    print("="*50)
+    analyzer.plot_comprehensive_analysis(evolution_results, alpha_results, omega_results, mri_results)
+    
+    # 8. Create movies if requested
+    if args.movie:
+        print("\n" + "="*50)
+        print("STEP 8: CREATING DENSITY EVOLUTION MOVIE")
+        print("="*50)
+        analyzer.create_density_movie(dump_files)
+    
+    if args.alpha_movie:
+        print("\n" + "="*50)
+        print("STEP 9: CREATING ALPHA PARAMETER MOVIE")
+        print("="*50)
+        analyzer.create_alpha_evolution_movie(dump_files, quasi_time)
+    
+    # 9. Print final summary
+    print("\n" + "="*60)
+    print("TORUS ANALYSIS COMPLETE - FINAL SUMMARY")
+    print("="*60)
+    
+    if mri_results:
+        print(f"MRI Resolution: {mri_results['avg_resolution']:.1f} cells/wavelength")
+        print(f"Assessment: {mri_results['assessment']}")
+    
+    if alpha_results:
+        alpha_mean = np.nanmean(alpha_results['alpha_total'])
+        alpha_mag = np.nanmean(alpha_results['alpha_magnetic'])
+        alpha_rey = np.nanmean(alpha_results['alpha_reynolds'])
+        print(f"\nAlpha Parameters:")
+        print(f"  Total α = {alpha_mean:.3f}")
+        print(f"  Magnetic α = {alpha_mag:.3f}")
+        print(f"  Reynolds α = {alpha_rey:.3f}")
+        print(f"  Magnetic dominance: {alpha_mag/(alpha_mag+alpha_rey)*100:.1f}%")
+    
+    if vertical_alpha_results:
+        alpha_z_mean = np.nanmean(vertical_alpha_results['alpha_z'])
+        alpha_r_mean = np.nanmean(vertical_alpha_results['alpha_r'])
+        print(f"\nVertical vs Radial Stress:")
+        print(f"  α_z (vertical) = {alpha_z_mean:.3f}")
+        print(f"  α_r (radial) = {alpha_r_mean:.3f}")
+        print(f"  Anisotropy α_z/α_r = {alpha_z_mean/alpha_r_mean:.2f}")
+    
+    if omega_results:
+        omega_ratio = np.nanmean(omega_results['omega_ratio'])
+        print(f"\nAngular Velocity:")
+        print(f"  Ω/Ω_Keplerian = {omega_ratio:.2f}")
+        if omega_ratio < 0.8:
+            print("  → Sub-Keplerian rotation (expected for accretion)")
+        elif omega_ratio > 1.2:
+            print("  → Super-Keplerian rotation (unusual)")
+        else:
+            print("  → Near-Keplerian rotation")
+    
+    if evolution_results:
+        total_time = evolution_results['times'][-1] - evolution_results['times'][0]
+        print(f"\nTime Evolution:")
+        print(f"  Total simulation time: {total_time:.1f}")
+        if quasi_time:
+            quasi_fraction = (evolution_results['times'][-1] - quasi_time) / total_time
+            print(f"  Quasi-stationary period: {quasi_fraction*100:.1f}% of simulation")
+    
+    print(f"\nPhysical Interpretation:")
+    print(f"• MRI drives magnetorotational turbulence")
+    print(f"• Alpha parameter quantifies effective viscosity")
+    print(f"• Magnetic stresses transport angular momentum")
+    print(f"• Turbulence enables efficient accretion")
+    
+    if mri_results and mri_results['avg_resolution'] < 10:
+        print(f"\nWARNING: MRI may be under-resolved!")
+        print(f"Consider increasing resolution for better MRI development")
+    
+    print(f"\nResults saved to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()

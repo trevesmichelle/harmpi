@@ -1,2 +1,44 @@
 # Ignore object files
 *.o
+
+# ====== Added by cleanup script ======
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Simulation data
+dumps/dump[0-9]*
+gdump
+dumps_*/
+
+# Results (generated files)
+results/
+*.mp4
+*.png
+*.jpg
+
+# Archives
+archive/
+
+# Compiled binaries
+harm
+gr
+image_interp
+*.o
+
+# Logs
+*.log
+nohup.out
+
+# Backups
+*.backup
+*.backup.*
+
+# XCode (if not needed)
+*.xcodeproj/
+*.xcworkspace/
+*.dSYM/
+

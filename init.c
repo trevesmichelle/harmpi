@@ -210,12 +210,12 @@ void init_torus()
   }
 
   /* output choices */
-  tf = 10000.0 ;
+  tf = 500.0 ; //originally 10000.0 --> then 1000.0
 
-  DTd = 10.; /* dumping frequency, in units of M */
-  DTl = 10. ;	/* logfile frequency, in units of M */
-  DTi = 10. ; 	/* image file frequ., in units of M */
-  DTr = 10. ; /* restart file frequ., in units of M */
+  DTd = 5.; /* dumping frequency, in units of M  (originally 10.) */
+  DTl = 5. ;	/* logfile frequency, in units of M (originally 10.) */
+  DTi = 5. ; 	/* image file frequ., in units of M (originally 10.) */
+  DTr = 25. ; /* restart file frequ., in units of M (originally 10.) */
   DTr01 = 100. ; /* restart file frequ., in timesteps */
 
   /* start diagnostic counters */
@@ -646,10 +646,10 @@ void init_bondi()
 	
 	// Set EXACTLY ONE of these to 1, others to 0
 	int PURE_BONDI = 0;                    // Pure spherical Bondi accretion
-	int BONDI_HOYLE_LYTTLETON = 0;         // Uniform wind case
+	int BONDI_HOYLE_LYTTLETON = 1;         // Uniform wind case
 	int DENSITY_GRADIENT = 0;              // Global density gradient
 	int ANGULAR_MOMENTUM = 0;              // Small initial angular momentum
-	int RANDOM_VELOCITY = 1;               // Random velocity field
+	int RANDOM_VELOCITY = 0;               // Random velocity field
 	
 // Wind velocity parameter - recommended values:
 // Pure Bondi: 0.0 (academic case)
@@ -1104,7 +1104,15 @@ void init_monopole(double Rout_val)
                 /* radial (monopolar) field version */
                 coord(i,j,k,CORN,X) ;
                 bl_coord(X,&r,&th,&phi) ;
-                A[i][j] = (1-cos(th)) ;
+                //A[i][j] = (1-cos(th)) ; // monopole
+
+                // Dipole field aligned with rotation axis
+                double mu_dipole = 10.0;  // Dipole strength (adjust if needed)
+                if(r > 1.5) {  // Outside horizon
+                    A[i][j] = mu_dipole * sin(th) * sin(th) / (r * r);
+                } else {
+                    A[i][j] = 0.0;  // No field inside horizon
+                }
 #endif
 
         }

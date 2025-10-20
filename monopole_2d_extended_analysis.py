@@ -166,7 +166,7 @@ class ImprovedMonopole2DAnalysis:
                 continue
         
         return results
-    
+    # NOTE: wrong terminology! make sure to make proper improvements in this script as well
     def analyze_fast_surface_improved(self, dump_files, sample_every=30):
         """Improved fast surface analysis"""
         print("=== IMPROVED FAST SURFACE ANALYSIS ===")

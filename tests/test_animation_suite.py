@@ -6,14 +6,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 """
 Test suite for animation methods in magnetized_analysis.py
 Tests the three new physics-focused animations with minimal dump files
+
+Usage (from root directory add tests/ before test_animation_suite.py):
+  python test_animation_suite.py                    # Quick test (first 10 dumps, all animations)
+  python test_animation_suite.py --full             # Full test (all dumps, all animations)
+  python test_animation_suite.py --velocity-full    # Full test for velocity animation only
+  python test_animation_suite.py --energy-full      # Full test for energy zones only
+  python test_animation_suite.py --magnetic-full    # Full test for magnetic topology only
 """
 
 import os
 import sys
 from magnetized_analysis import MagnetizedAnalysis, get_dump_files
 
-def test_animation_suite(full_test=False):
-    """Test all three animation methods"""
+def test_animation_suite(full_test=False, test_filter=None):
+    """
+    Test all three animation methods
+    
+    Parameters:
+    -----------
+    full_test : bool
+        If True, use all dump files. If False, use first 10.
+    test_filter : str or None
+        If specified, only run test matching this name (e.g., 'Energy Zones')
+    """
     
     # Test configuration
     test_dir = "./animation_tests"
@@ -35,6 +51,8 @@ def test_animation_suite(full_test=False):
     
     print("=" * 70)
     print("ANIMATION SUITE TEST")
+    if test_filter:
+        print(f"FILTERED: Testing only '{test_filter}'")
     print("=" * 70)
     print(f"Testing with {len(test_dumps)} dump files")
     print(f"Dump range: {test_dumps[0]} to {test_dumps[-1]}")
@@ -43,7 +61,7 @@ def test_animation_suite(full_test=False):
     # Initialize analyzer
     analyzer = MagnetizedAnalysis(output_dir=test_dir)
     
-    # Test definitions - UPDATED for new method names
+    # Test definitions
     tests = [
         {
             'name': 'Velocity & Stagnation',
@@ -77,6 +95,14 @@ def test_animation_suite(full_test=False):
         }
     ]
     
+    # Filter tests if requested
+    if test_filter:
+        tests = [t for t in tests if test_filter.lower() in t['name'].lower()]
+        if not tests:
+            print(f"❌ ERROR: No tests match filter '{test_filter}'")
+            return False
+        print(f"Running {len(tests)} test(s) matching '{test_filter}'")
+    
     # Run tests
     results = []
     for i, test in enumerate(tests, 1):
@@ -100,7 +126,7 @@ def test_animation_suite(full_test=False):
                 results.append(('PASS', test['name'], file_size))
             else:
                 print(f"✗ FAILED: {test['name']} - File not created")
-                results.append(('FAIL', test['name'], f"File not created"))
+                results.append(('FAIL', test['name'], "File not created"))
                 
         except Exception as e:
             print(f"✗ FAILED: {test['name']}")
@@ -134,8 +160,20 @@ def test_animation_suite(full_test=False):
 
 
 if __name__ == "__main__":
-    # Check command line arguments
+    # Parse command line arguments
     full_test = '--full' in sys.argv
     
-    success = test_animation_suite(full_test=full_test)
+    # Individual test flags (with full depth)
+    test_filter = None
+    if '--velocity-full' in sys.argv:
+        full_test = True
+        test_filter = 'Velocity'
+    elif '--energy-full' in sys.argv:
+        full_test = True
+        test_filter = 'Energy'
+    elif '--magnetic-full' in sys.argv:
+        full_test = True
+        test_filter = 'Magnetic'
+    
+    success = test_animation_suite(full_test=full_test, test_filter=test_filter)
     sys.exit(0 if success else 1)

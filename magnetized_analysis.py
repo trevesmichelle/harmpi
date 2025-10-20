@@ -2813,17 +2813,15 @@ class MagnetizedAnalysis:
                                     output_file="energy_zones.mp4",
                                     fps=10, sample_every=3, early_resolution_boost=True):
         """
-        Two-panel animation: Energy flux zones + Statistics
+        Two-panel animation: Energy flux zones + Integrated Power Evolution
         
         Panel 1: -T^t_r (energy flux) showing extraction (blue) vs dissipation (red)
-        Panel 2: Time evolution of zone percentages
+        Panel 2: INTEGRATED POWER over time (replaces spatial coverage)
         
-        Features:
-        - Diverging colormap (RdBu_r) for extraction/dissipation
-        - Zero contour shows boundary
-        - Statistics tracking over time
-        - Full-circle visualization
-        - Variable sampling: detailed early, overview late (if enabled)
+        NEW APPROACH: Uses physics from create_power_extraction_animation
+        - Calculates P(r) = |E_r| × 4πr² at each timestep
+        - Tracks extraction power, dissipation power, net power
+        - More physically meaningful than cell counting
         
         Parameters:
         -----------
@@ -2852,7 +2850,7 @@ class MagnetizedAnalysis:
             sampled_files = dump_files[::sample_every]
             print(f"Uniform sampling: {len(sampled_files)} frames")
         
-        # Data calibration - IMPROVED: use broader percentile range
+        # Data calibration
         print("Calibrating energy flux...")
         all_Ttr = []
         
@@ -2872,7 +2870,6 @@ class MagnetizedAnalysis:
                 continue
         
         if all_Ttr:
-            # Use 95th percentile for better visibility
             abs_max = np.percentile(np.abs(all_Ttr), 95)
             global_Ttr_min = -abs_max
             global_Ttr_max = abs_max
@@ -2881,21 +2878,20 @@ class MagnetizedAnalysis:
         
         print(f"Energy flux range: {global_Ttr_min:.3e} to {global_Ttr_max:.3e}")
         
-        # Create figure with better layout
+        # Create figure
         fig = plt.figure(figsize=(16, 7))
         ax1 = plt.subplot(121)
         ax2 = plt.subplot(122)
         
-        # Better layout - prevent title cutoff
         plt.subplots_adjust(top=0.90, bottom=0.10, left=0.05, right=0.95, wspace=0.25)
         
-        # Storage for statistics
+        # Storage for integrated power (NEW!)
         times_list = []
-        extraction_frac = []
-        dissipation_frac = []
-        net_power = []
+        extraction_power_list = []  # Total power from extraction zones
+        dissipation_power_list = []  # Total power from dissipation zones
+        net_power_list = []  # Net power (extraction - dissipation)
         
-        # Initialize
+        # Initialize first frame
         self.load_data("gdump", sampled_files[0])
         r_2d = hs.r.squeeze()
         h_2d = hs.h.squeeze()
@@ -2921,7 +2917,7 @@ class MagnetizedAnalysis:
                             shading='auto', rasterized=True)
         cbar1 = plt.colorbar(im1, ax=ax1, label='-T^t_r (code units)', 
                             fraction=0.046, pad=0.04)
-        cbar1.ax.tick_params(labelsize=9)  # Smaller ticks
+        cbar1.ax.tick_params(labelsize=9)
         cbar1.ax.axhline(y=0, color='black', linewidth=2, linestyle='--')
         
         # Set axis properties
@@ -2933,11 +2929,11 @@ class MagnetizedAnalysis:
         ax1.tick_params(labelsize=9)
         
         ax2.set_xlabel('Time (M)', fontsize=11)
-        ax2.set_ylabel('Domain Fraction (%)', fontsize=11)
+        ax2.set_ylabel('Integrated Power (code units)', fontsize=11)
         ax2.tick_params(labelsize=9)
         
-        # Add physics context as figure suptitle
-        fig.suptitle('Blandford-Znajek Energy Flux: -T^t_r = -(ρ+u+p)u^r - b^r b^t', 
+        # Suptitle
+        fig.suptitle('BZ Energy Extraction: -T^t_r and Integrated Power Evolution', 
                     fontsize=13, fontweight='bold', y=0.96)
         
         def animate(frame):
@@ -2971,7 +2967,9 @@ class MagnetizedAnalysis:
             z_full = np.concatenate([z[:, ::-1], z], axis=1)
             Ttr_full = np.concatenate([Ttr[:, ::-1], Ttr], axis=1)
             
-            # PANEL 1: Energy Flux Map
+            # ====================================================================
+            # PANEL 1: Energy Flux Map (unchanged)
+            # ====================================================================
             im1_new = ax1.pcolormesh(x_full, z_full, Ttr_full, cmap='RdBu_r',
                                     vmin=global_Ttr_min, vmax=global_Ttr_max,
                                     shading='auto', rasterized=True)
@@ -2988,7 +2986,7 @@ class MagnetizedAnalysis:
                             linewidth=2, alpha=1.0, zorder=10)
             ax1.add_patch(circle)
             
-            # Minimal labels
+            # Labels
             ax1.text(0.98, 0.98, 'Blue: Extraction\n(Energy Out)',
                     transform=ax1.transAxes, fontsize=9, ha='right', va='top',
                     bbox=dict(boxstyle="round,pad=0.2", facecolor="lightblue", alpha=0.8))
@@ -3004,40 +3002,60 @@ class MagnetizedAnalysis:
             ax1.tick_params(labelsize=9)
             ax1.grid(True, alpha=0.2)
             
-            # PANEL 2: Statistics - CLEARER DESCRIPTION
-            extraction_zone = Ttr > 0
-            dissipation_zone = Ttr < 0
+            # ====================================================================
+            # PANEL 2: INTEGRATED POWER EVOLUTION (NEW!)
+            # Using logic from create_power_extraction_animation
+            # ====================================================================
             
-            total_cells = Ttr.size
-            extr_frac = extraction_zone.sum() / total_cells * 100
-            diss_frac = dissipation_zone.sum() / total_cells * 100
-            net_pwr = Ttr.sum()
+            # Calculate integrated power at this timestep
+            # Average energy flux over theta (if 2D)
+            if Ttr.ndim > 1:
+                energy_flux_avg = Ttr.mean(axis=1)  # Average over theta
+                r_coord = r_2d[:, 0]  # Radial coordinate
+            else:
+                energy_flux_avg = Ttr
+                r_coord = r_2d
             
+            # Integrated power: P(r) = |E_r| × 4πr²
+            # This converts energy flux density to total power through spherical shell
+            integrated_power_profile = np.abs(energy_flux_avg) * 4 * np.pi * r_coord**2
+            
+            # Split into extraction and dissipation zones
+            extraction_mask = energy_flux_avg > 0
+            dissipation_mask = energy_flux_avg < 0
+            
+            # Total power in each zone (sum over all radii)
+            extraction_power = np.sum(integrated_power_profile[extraction_mask]) if np.any(extraction_mask) else 0
+            dissipation_power = np.sum(integrated_power_profile[dissipation_mask]) if np.any(dissipation_mask) else 0
+            net_power = extraction_power - dissipation_power
+            
+            # Store for time series
             times_list.append(current_time)
-            extraction_frac.append(extr_frac)
-            dissipation_frac.append(diss_frac)
-            net_power.append(net_pwr)
+            extraction_power_list.append(extraction_power)
+            dissipation_power_list.append(dissipation_power)
+            net_power_list.append(net_power)
             
-            # Plot evolution
-            ax2.plot(times_list, extraction_frac, 'b-', linewidth=2.5, 
-                    label='Extraction Zone (% of cells)', marker='o', markersize=3)
-            ax2.plot(times_list, dissipation_frac, 'r-', linewidth=2.5,
-                    label='Dissipation Zone (% of cells)', marker='s', markersize=3)
-            ax2.axhline(y=50, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+            # Plot power evolution
+            ax2.plot(times_list, extraction_power_list, 'b-', linewidth=2.5,
+                    label='Extraction Power', marker='o', markersize=3)
+            ax2.plot(times_list, dissipation_power_list, 'r-', linewidth=2.5,
+                    label='Dissipation Power', marker='s', markersize=3)
+            ax2.plot(times_list, net_power_list, 'k--', linewidth=2.5,
+                    label='Net Power', alpha=0.7, marker='^', markersize=3)
+            ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5, linewidth=1.5)
             
             ax2.set_xlabel('Time (M)', fontsize=11)
-            ax2.set_ylabel('Spatial Coverage (%)', fontsize=11)  # CLEARER
-            ax2.set_title('Energy Zone Evolution', fontsize=12, fontweight='bold', pad=8)
+            ax2.set_ylabel('Integrated Power (code units)', fontsize=11)
+            ax2.set_title('Total Integrated Power Evolution', fontsize=12, fontweight='bold', pad=8)
             ax2.legend(loc='best', fontsize=9, framealpha=0.9)
             ax2.grid(True, alpha=0.3)
-            ax2.set_ylim(0, 100)
             ax2.tick_params(labelsize=9)
             
-            # Stats box - CLEARER LABELS
+            # Stats box
             stats_text = (f'Time: {current_time:.1f}M\n'
-                        f'Extraction: {extr_frac:.1f}% of cells\n'
-                        f'Dissipation: {diss_frac:.1f}% of cells\n'
-                        f'Net flux: {net_pwr:.2e}')
+                        f'Extraction: {extraction_power:.2e}\n'
+                        f'Dissipation: {dissipation_power:.2e}\n'
+                        f'Net: {net_power:.2e}')
             ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes,
                     fontsize=9, va='top', ha='left',
                     bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9))

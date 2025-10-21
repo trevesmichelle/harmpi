@@ -646,23 +646,22 @@ void init_bondi()
 	
 	// Set EXACTLY ONE of these to 1, others to 0
 	int PURE_BONDI = 0;                    // Pure spherical Bondi accretion
-	int BONDI_HOYLE_LYTTLETON = 1;         // Uniform wind case
+	int BONDI_HOYLE_LYTTLETON = 0;         // Uniform wind case
 	int DENSITY_GRADIENT = 0;              // Global density gradient
 	int ANGULAR_MOMENTUM = 0;              // Small initial angular momentum
-	int RANDOM_VELOCITY = 0;               // Random velocity field
+	int RANDOM_VELOCITY = 1;               // Random velocity field
 	
-// Wind velocity parameter - recommended values:
-// Pure Bondi: 0.0 (academic case)
-// BHL: 0.1 (strong wind)
-// Density Gradient: 0.02-0.05 (ambient wind + gradient)
-// Angular Momentum: 0.02-0.05 (ambient wind + rotation)
-// Random Velocity: 0.02-0.05 (ambient wind + turbulence)
-  double v_wind = 0.05;
+	// Wind velocity parameter - recommended values:
+	// Pure Bondi: 0.0 (no wind)
+	// BHL: 0.1 (strong wind in z-direction)
+	// Density Gradient: 0.02-0.05 (ambient wind + gradient)
+	// Angular Momentum: 0.0 (no wind needed)
+	// Random Velocity: 0.02-0.05 (ambient wind + turbulence)
+	double v_z_wind = 0.1;  // RENAMED: z-velocity (not theta-velocity!)
 
-// Other scenario parameters
-
+	// Other scenario parameters
 	double density_gradient_index = 1.5;   // Power law index for density gradient 
-	double omega_init_amplitude =  0.0;    // Angular momentum strength (must be small, otherwise instability breaks the simulation). set to 0.0 for other scenarios
+	double omega_init_amplitude = 0.05;    // Angular momentum strength
 	double turbulence_amplitude = 0.1;     // Random velocity amplitude
 	
 	// =================================================================
@@ -671,74 +670,72 @@ void init_bondi()
 	gam = 4./3. ;
 
 	/* black hole parameters */
-        a = 0.9375 ;
+	a = 0.9375 ;
 
 	kappa = 1.e-3 ;
 
 	/* radius of the inner edge of the initial density distribution */
 	rin = 10.;
 
-        /* some numerical parameters */
-        lim = MC ;
-        failed = 0 ;	/* start slow */
-        cour = 0.9 ;  // original value 0.9
-        dt = 1.e-5 ;  // original value 1.e-5
+	/* some numerical parameters */
+	lim = MC ;
+	failed = 0 ;	/* start slow */
+	cour = 0.9 ;
+	dt = 1.e-5 ;
 	rhor = (1. + sqrt(1. - a*a)) ;
 	R0 = -2*rhor ;
-        Rin = 0.5*rhor ;
-        Rout = 1e3 ;
-        rbr = Rout*10.;
-        npow2=4.0; //power exponent
-        cpow2=1.0; //exponent prefactor (the larger it is, the more hyperexponentiation is)
+	Rin = 0.5*rhor ;
+	Rout = 1e3 ;
+	rbr = Rout*10.;
+	npow2=4.0;
+	cpow2=1.0;
 
-
-        t = 0. ;
-        hslope = 1.0 ; //uniform angular grid
+	t = 0. ;
+	hslope = 1.0 ;
 
 	if(N2!=1) {
-	  //2D problem, use full pi-wedge in theta
-	  fractheta = 1.;
+		fractheta = 1.;
 	}
 	else{
-	  //1D problem (since only 1 cell in theta-direction), use a restricted theta-wedge
-	  fractheta = 1.e-2;
+		fractheta = 1.e-2;
 	}
-        fracphi = 1.;
+	fracphi = 1.;
 
-        set_arrays() ;
-        set_grid() ;
+	set_arrays() ;
+	set_grid() ;
 
 	coord(-2,0,0,CENT,X) ;
 	bl_coord(X,&r,&th,&phi) ;
 	fprintf(stderr,"rmin: %g\n",r) ;
 	fprintf(stderr,"rmin/rm: %g\n",r/(1. + sqrt(1. - a*a))) ;
 
-        /* output choices */
+	/* output choices */
 	tf = Rout ;
 
-	DTd = 2. ;	/* dumping frequency, in units of M */
-	DTl = 2. ;	/* logfile frequency, in units of M */
-	DTi = 2. ; 	/* image file frequ., in units of M */
-        DTr = 50 ; /* restart file frequ., in units of M */
-        DTr01 = 1000 ; /* restart file frequ., in timesteps */
+	DTd = 2. ;
+	DTl = 2. ;
+	DTi = 2. ;
+	DTr = 50 ;
+	DTr01 = 1000 ;
 
 	/* start diagnostic counters */
 	dump_cnt = 0 ;
 	image_cnt = 0 ;
 	rdump_cnt = 0 ;
-        rdump01_cnt = 0 ;
+	rdump01_cnt = 0 ;
 	defcon = 1. ;
 
 	// Print which scenario is active
 	if(PURE_BONDI) fprintf(stderr,"Scenario: Pure Bondi accretion\n");
-	else if(BONDI_HOYLE_LYTTLETON) fprintf(stderr,"Scenario: Bondi-Hoyle-Lyttleton (v_wind=%.2f)\n", v_wind);
-	else if(DENSITY_GRADIENT) fprintf(stderr,"Scenario: Density gradient (index=%.2f)\n", density_gradient_index);
+	else if(BONDI_HOYLE_LYTTLETON) fprintf(stderr,"Scenario: Bondi-Hoyle-Lyttleton (v_z=%.2f)\n", v_z_wind);
+	else if(DENSITY_GRADIENT) fprintf(stderr,"Scenario: Density gradient (index=%.2f, v_z=%.2f)\n", density_gradient_index, v_z_wind);
 	else if(ANGULAR_MOMENTUM) fprintf(stderr,"Scenario: Angular momentum (omega=%.3f)\n", omega_init_amplitude);
-	else if(RANDOM_VELOCITY) fprintf(stderr,"Scenario: Random velocity (amplitude=%.2f)\n", turbulence_amplitude);
+	else if(RANDOM_VELOCITY) fprintf(stderr,"Scenario: Random velocity (amplitude=%.2f, v_z=%.2f)\n", turbulence_amplitude, v_z_wind);
 	else fprintf(stderr,"WARNING: No scenario selected or multiple scenarios active!\n");
 
 	rhomax = 0. ;
 	umax = 0. ;
+	
 	ZSLOOP(0,N1-1,0,N2-1,0,N3-1) {
 		coord(i,j,k,CENT,X) ;
 		bl_coord(X,&r,&th,&phi) ;
@@ -746,56 +743,43 @@ void init_bondi()
 		sth = sin(th) ;
 		cth = cos(th) ;
 
-		/* regions outside uniform density distribution */
+		// =================================================================
+		// REGION 1: r < rin (evacuated inner region)
+		// =================================================================
 		if(r < rin) {
 			rho = 1.e-7*RHOMIN ;
-                        u = 1.e-7*UUMIN ;
+			u = 1.e-7*UUMIN ;
 
-			/* these values are demonstrably physical
-			   for all values of a and r */
-			/*
-                        ur = -1./(r*r) ;
-                        uh = 0. ;
-			up = 0. ;
-			*/
-
-			// Initialize velocities based on selected scenario
+			// Initialize velocities
 			ur = 0. ;
 			uh = 0. ;
 			up = 0. ;
 
-      // Apply Bondi radial infall for scenarios that need it
-      if(PURE_BONDI || ANGULAR_MOMENTUM) {
-          ur = -0.01 / (r * r);  // Radial Bondi infall
-      }
+			// Apply small radial infall for most scenarios
+			if(PURE_BONDI || ANGULAR_MOMENTUM || BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT) {
+				ur = -0.01 / (r * r);  // Weak pressure-driven inflow
+			}
 
-      // Apply wind only for BHL scenario  
-      if(BONDI_HOYLE_LYTTLETON) {
-          uh = v_wind;  // Wind velocity
-          ur = -0.01 / (r * r);  // Plus radial infall
-      }
+			// CORRECTED: Add z-velocity using proper coordinate transformation
+			if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT) {
+				double gamma_z = 1.0 / sqrt(1.0 - v_z_wind * v_z_wind);
+				
+				// Transform v_z to Boyer-Lindquist 4-velocity components
+				ur += gamma_z * v_z_wind * cth;           // Radial component
+				uh = -gamma_z * v_z_wind * sth / r;       // Theta component
+			}
 
-      if(DENSITY_GRADIENT) {
-          uh = v_wind;  // Apply ambient wind
-          ur = -0.01 / (r * r);  // Plus radial infall
-      }
-
-      if(RANDOM_VELOCITY) {
-          uh = v_wind;  // Add baseline wind first
-          ur = -0.01 / (r * r);  // Add baseline infall
-          // Add random velocity perturbations on top of baseline wind
-          double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
-          ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);
-          uh += turbulence_amplitude * (2.0 * fmod(rand_seed * 1.618, 1.0) - 0.5);
-          up += turbulence_amplitude * (2.0 * fmod(rand_seed * 2.718, 1.0) - 0.5);
-      }
-
-			/*
-			get_geometry(i,j,CENT,&geom) ;
-                        ur = geom.gcon[0][1]/geom.gcon[0][0] ;
-                        uh = geom.gcon[0][2]/geom.gcon[0][0] ;
-                        up = geom.gcon[0][3]/geom.gcon[0][0] ;
-			*/
+			if(RANDOM_VELOCITY) {
+				double gamma_z = 1.0 / sqrt(1.0 - v_z_wind * v_z_wind);
+				ur += gamma_z * v_z_wind * cth;
+				uh = -gamma_z * v_z_wind * sth / r;
+				
+				// Add random perturbations
+				double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
+				ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);
+				uh += turbulence_amplitude * (2.0 * fmod(rand_seed * 1.618, 1.0) - 0.5);
+				up += turbulence_amplitude * (2.0 * fmod(rand_seed * 2.718, 1.0) - 0.5);
+			}
 
 			p[i][j][k][RHO] = rho ;
 			p[i][j][k][UU] = u ;
@@ -803,109 +787,122 @@ void init_bondi()
 			p[i][j][k][U2] = uh ;
 			p[i][j][k][U3] = up ;
 		}
-		/* region inside initial uniform density */
-		else { 
-      // Base density and pressure - use appropriate profile for each scenario
-      if(DENSITY_GRADIENT) {
-          rho = 1. * pow(r/rin, -density_gradient_index);  // Handle density gradient first
-      } else if(ANGULAR_MOMENTUM || PURE_BONDI) {
-          //rho = 1.0 * pow(r/rin, -1.5);  // r^(-3/2) profile like Bondi
-          rho = 1.0 * pow(r/rin, -0.3);  // Even gentler than -0.5
-      } else {
-          rho = 1.;  // Keep constant for other scenarios (BHL, random velocity)
-      }
+		// =================================================================
+		// REGION 2: r >= rin (ambient medium)
+		// =================================================================
+		else {
+			// Set density profile based on scenario
+			if(DENSITY_GRADIENT) {
+				rho = 1.0 * pow(r/rin, -density_gradient_index);
+			} 
+			else if(PURE_BONDI || ANGULAR_MOMENTUM) {
+				// Gentle profile for stability
+				rho = 1.0 * pow(r/rin, -0.3);
+			} 
+			else {
+				// Uniform for BHL and random velocity
+				rho = 1.0;
+			}
 
-		  u = kappa*pow(rho,gam)/(gam - 1.) ;
+			u = kappa*pow(rho,gam)/(gam - 1.) ;
 
 			// Initialize velocities
 			ur = 0. ;
 			uh = 0. ;
 			up = 0. ;
 
-      // Apply Bondi radial infall for scenarios that need it
-      if(PURE_BONDI || ANGULAR_MOMENTUM) {
-          //ur = -0.01 / (r * r);  // Radial Bondi infall
-          ur = -0.001 / (r * r);  // Much weaker inflow
-      }
+			// Apply small radial infall for scenarios that need it
+			if(PURE_BONDI || ANGULAR_MOMENTUM) {
+				ur = -0.001 / (r * r);  // Very weak for stability
+			}
+			else if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT) {
+				ur = -0.01 / (r * r);  // Slightly stronger
+			}
 
-      // Apply wind only for BHL scenario  
-      if(BONDI_HOYLE_LYTTLETON) {
-          uh = v_wind;  // Wind velocity
-          ur = -0.01 / (r * r);  // Plus radial infall
-      }
+			// CORRECTED: Apply z-wind using proper transformation
+			if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT) {
+				double gamma_z = 1.0 / sqrt(1.0 - v_z_wind * v_z_wind);
+				
+				// THIS IS THE CORRECT WAY to add z-velocity!
+				ur += gamma_z * v_z_wind * cth;
+				uh = -gamma_z * v_z_wind * sth / r;
+			}
 
-      if(ANGULAR_MOMENTUM && r > 6.0) {  // Only apply rotation outside ISCO
-          double r_isco = 6.0;  // Conservative ISCO estimate for a=0.9375
-          // up = omega_init_amplitude * sqrt(r_isco/r) * sth;  // Keplerian profile
-          up = omega_init_amplitude * sth;  // Constant, not Keplerian
+			// Angular momentum (rotation around z-axis)
+			if(ANGULAR_MOMENTUM && r > 6.0) {
+				up = omega_init_amplitude * sth;  // φ-velocity
+			}
 
-      }
+			// Random velocity perturbations
+			if(RANDOM_VELOCITY) {
+				double gamma_z = 1.0 / sqrt(1.0 - v_z_wind * v_z_wind);
+				ur += gamma_z * v_z_wind * cth;
+				uh = -gamma_z * v_z_wind * sth / r;
+				
+				// Add turbulent fluctuations
+				double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
+				ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);
+				uh += turbulence_amplitude * (2.0 * fmod(rand_seed * 1.618, 1.0) - 0.5);
+				up += turbulence_amplitude * (2.0 * fmod(rand_seed * 2.718, 1.0) - 0.5);
+			}
 
-      if(DENSITY_GRADIENT) {
-        uh = v_wind;  
-        ur = -0.01 / (r*r);  // Small pressure-driven inflow
-      }
-
-      if(RANDOM_VELOCITY) {
-          uh = v_wind;  // Add baseline wind first
-          ur = -0.01 / (r * r);  // Add baseline infall
-          // Add random velocity perturbations on top of baseline wind
-          double rand_seed = fmod(1000.0 * (r + th + phi), 1.0);
-          ur += turbulence_amplitude * (2.0 * rand_seed - 1.0);
-          uh += turbulence_amplitude * (2.0 * fmod(rand_seed * 1.618, 1.0) - 0.5);
-          up += turbulence_amplitude * (2.0 * fmod(rand_seed * 2.718, 1.0) - 0.5);
-      }
-
-
-		  p[i][j][k][RHO] = rho ;
-		  if(rho > rhomax) rhomax = rho ;
-		  p[i][j][k][UU] = u;
-		  if(u > umax && r > rin) umax = u ;
-		  p[i][j][k][U1] = ur ;
-		  p[i][j][k][U2] = uh ;
-		  p[i][j][k][U3] = up ;
-		  
-		  /* convert from 4-vel to 3-vel */
-		  coord_transform(p[i][j][k],i,j,k) ;
+			p[i][j][k][RHO] = rho ;
+			if(rho > rhomax) rhomax = rho ;
+			p[i][j][k][UU] = u;
+			if(u > umax && r > rin) umax = u ;
+			p[i][j][k][U1] = ur ;
+			p[i][j][k][U2] = uh ;
+			p[i][j][k][U3] = up ;
+			
+			/* convert from 4-vel to 3-vel */
+			coord_transform(p[i][j][k],i,j,k) ;
 		}
 
+		// Zero magnetic field (pure hydrodynamic problem)
 		p[i][j][k][B1] = 0. ;
 		p[i][j][k][B2] = 0. ;
 		p[i][j][k][B3] = 0. ;
-
 	}
 
 	fixup(p) ;
 	bound_prim(p) ;
 
-  // Print final summary
+	// Print final summary
 	fprintf(stderr,"Setup complete: rhomax=%.2e, umax=%.2e\n", rhomax, umax);
+	
+	// Print verification info
+	if(BONDI_HOYLE_LYTTLETON || DENSITY_GRADIENT || RANDOM_VELOCITY) {
+		fprintf(stderr,"Z-velocity transformation applied: v_z=%.3f\n", v_z_wind);
+		fprintf(stderr,"  Lorentz factor: gamma=%.4f\n", 1.0/sqrt(1.0 - v_z_wind*v_z_wind));
+		fprintf(stderr,"  At equator (theta=pi/2): u^r ≈ 0, u^theta ≈ -gamma*v_z/r\n");
+		fprintf(stderr,"  At pole (theta=0): u^r ≈ gamma*v_z, u^theta ≈ 0\n");
+	}
     
 
 #if(0) //disable for now
 	/* first find corner-centered vector potential */
 	ZSLOOP(0,N1,0,N2,0,N3) A[i][j][k] = 0. ;
-        ZSLOOP(0,N1,0,N2,0,N3) {
-                /* vertical field version */
-                /*
-                coord(i,j,l,CORN,X) ;
-                bl_coord(X,&r,&th,&phi) ;
+	ZSLOOP(0,N1,0,N2,0,N3) {
+		/* vertical field version */
+		/*
+		coord(i,j,l,CORN,X) ;
+		bl_coord(X,&r,&th,&phi) ;
 
-                A[i][j][k] = 0.5*r*sin(th) ;
-                */
+		A[i][j][k] = 0.5*r*sin(th) ;
+		*/
 
-                /* field-in-disk version */
+		/* field-in-disk version */
 		/* flux_ct */
-                rho_av = 0.25*(
-                        p[i][j][RHO] +
-                        p[i-1][j][RHO] +
-                        p[i][j-1][RHO] +
-                        p[i-1][j-1][RHO]) ;
+		rho_av = 0.25*(
+			p[i][j][RHO] +
+			p[i-1][j][RHO] +
+			p[i][j-1][RHO] +
+			p[i-1][j-1][RHO]) ;
 
-                q = rho_av/rhomax - 0.2 ;
-                if(q > 0.) A[i][j][k] = q ;
+		q = rho_av/rhomax - 0.2 ;
+		if(q > 0.) A[i][j][k] = q ;
 
-        }
+	}
 
 	/* now differentiate to find cell-centered B,
 	   and begin normalization */
@@ -977,6 +974,25 @@ void init_monopole(double Rout_val)
 	double rho_av,rhomax,umax,beta,bsq_ij,bsq_max,norm,q,beta_act ;
 	double rmax, lfish_calc(double rmax) ;
 
+  // =================================================================
+	// MAGNETIC FIELD CONFIGURATION - MODIFY THESE TO SWITCH SCENARIOS
+	// =================================================================
+	
+	// Set EXACTLY ONE of these to 1, others to 0
+	int MONOPOLE_FIELD = 0;      // Standard radial monopole field
+	int DIPOLE_FIELD = 0;        // Dipole field aligned with spin axis
+	int SPLIT_MONOPOLE = 1;      // Split monopole (different N/S hemispheres)
+	
+	// Split monopole parameters (only used if SPLIT_MONOPOLE == 1)
+	double split_theta_boundary = M_PI/2.0;  // Where field splits (equator)
+	double split_north_strength = 1.0;       // Relative strength above boundary
+	double split_south_strength = 1.0;       // Relative strength below boundary
+	
+	// Dipole parameters (only used if DIPOLE_FIELD == 1)
+	double mu_dipole = 1.0;  // Dipole moment strength
+	
+	// =================================================================
+
 	/* some physics parameters */
 	gam = 4./3. ;
 
@@ -1040,6 +1056,11 @@ void init_monopole(double Rout_val)
         rdump01_cnt = 0 ;
 	defcon = 1. ;
 
+	// Print which magnetic field configuration is active
+	if(MONOPOLE_FIELD) fprintf(stderr,"Magnetic field: Standard monopole\n");
+	else if(DIPOLE_FIELD) fprintf(stderr,"Magnetic field: Dipole (mu=%.2f)\n", mu_dipole);
+	else if(SPLIT_MONOPOLE) fprintf(stderr,"Magnetic field: Split monopole (theta=%.3f)\n", split_theta_boundary);
+
 	rhomax = 0. ;
 	umax = 0. ;
 	ZSLOOP(0,N1-1,0,N2-1,0,N3-1) {
@@ -1095,26 +1116,37 @@ void init_monopole(double Rout_val)
 	/* first find corner-centered vector potential */
 	ZSLOOP(0,N1,0,N2,0,0) A[i][j] = 0. ;
         ZSLOOP(0,N1,0,N2,0,0) {
-#if(0)
-                /* vertical field version */
                 coord(i,j,k,CORN,X) ;
                 bl_coord(X,&r,&th,&phi) ;
-                A[i][j] = 0.5*pow(r*sin(th),2);
-#elif(1)
-                /* radial (monopolar) field version */
-                coord(i,j,k,CORN,X) ;
-                bl_coord(X,&r,&th,&phi) ;
-                //A[i][j] = (1-cos(th)) ; // monopole
-
-                // Dipole field aligned with rotation axis
-                double mu_dipole = 10.0;  // Dipole strength (adjust if needed)
-                if(r > 1.5) {  // Outside horizon
-                    A[i][j] = mu_dipole * sin(th) * sin(th) / (r * r);
-                } else {
-                    A[i][j] = 0.0;  // No field inside horizon
+                
+                if(MONOPOLE_FIELD) {
+                    /* Standard radial monopole field */
+                    A[i][j] = (1.0 - cos(th));
                 }
-#endif
-
+                else if(DIPOLE_FIELD) {
+                    /* Dipole field aligned with rotation axis */
+                    if(r > 1.5) {  // Outside horizon
+                        A[i][j] = mu_dipole * sin(th) * sin(th) / r;
+                    } else {
+                        A[i][j] = 0.0;  // No field inside horizon
+                    }
+                }
+                else if(SPLIT_MONOPOLE) {
+                    /* Split monopole - different field above/below boundary */
+                    if(th < split_theta_boundary) {
+                        // Northern hemisphere
+                        A[i][j] = split_north_strength * (1.0 - cos(th));
+                    } else {
+                        // Southern hemisphere  
+                        double th_rel = th - split_theta_boundary;
+                        A[i][j] = split_south_strength * (1.0 - cos(th_rel));
+                    }
+                }
+                else {
+                    fprintf(stderr, "ERROR: No magnetic field configuration selected!\n");
+                    fprintf(stderr, "Set exactly ONE field type to 1 in init_monopole()\n");
+                    exit(1);
+                }
         }
 
 	/* now differentiate to find cell-centered B,

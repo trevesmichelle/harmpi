@@ -3472,11 +3472,15 @@ class MagnetizedAnalysis:
                 ax3.grid(True, alpha=0.3)
                 
                 # Add horizontal reference lines for multipole orders
-                for l, label, color in [(0, 'Monopole (l=0)', 'blue'), 
-                                        (1, 'Dipole (l=1)', 'orange'), 
-                                        (2, 'Quadrupole (l=2)', 'green')]:
-                    ax3.axhline(y=l, color=color, linestyle='--', alpha=0.2, linewidth=1.5)
-                    ax3.text(times[-1]*0.02, l, f' {label}', fontsize=8, va='center', color=color, alpha=0.7)
+                max_order = max(dominant_orders) if dominant_orders else 0
+                reference_lines = [(0, 'Monopole (ℓ=0)', 'blue'), 
+                                (1, 'Dipole (ℓ=1)', 'orange'), 
+                                (2, 'Quadrupole (ℓ=2)', 'green')]
+
+                for l, label, color in reference_lines:
+                    if l <= max_order:  # Only draw if relevant
+                        ax3.axhline(y=l, color=color, linestyle='--', alpha=0.2, linewidth=1.5)
+                        ax3.text(times[-1]*0.02, l, f' {label}', fontsize=8, va='center', color=color, alpha=0.7)
                 
                 # Classification text box
                 final_topo = results['topology_evolution'][-1]

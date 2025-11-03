@@ -33,7 +33,9 @@ class MagnetizedAnalysis:
     
     def detect_field_type(self, dump_file):
         """
-        Automatically detect field type (monopole vs dipole) from simulation data
+        Detect field type using Legendre decomposition (proper method).
+        
+        This replaces the old heuristic method with proper multipole analysis.
         """
         try:
             self.load_data("gdump", dump_file)
@@ -42,40 +44,70 @@ class MagnetizedAnalysis:
                 return "Unknown"
             
             B_r = hs.B[1].squeeze()
-            B_theta = hs.B[2].squeeze()
             
             if B_r.ndim < 2:
                 return "1D"
             
-            # Check field reversal across equator (dipole signature)
-            n_theta = B_r.shape[1]
-            north_quarter = n_theta // 4
-            south_quarter = 3 * n_theta // 4
-            
-            # Average field in northern and southern hemispheres
-            B_r_north = B_r[:10, :north_quarter].mean()
-            B_r_south = B_r[:10, south_quarter:].mean()
-            
-            # Check for field reversal (dipole signature)
-            field_reversal = (B_r_north * B_r_south < 0)
-            
-            # Check pole/equator ratio
-            equator_idx = n_theta // 2
-            pole_field = np.sqrt(B_r[:10, 0]**2 + B_theta[:10, 0]**2).mean()
-            equator_field = np.sqrt(B_r[:10, equator_idx]**2 + B_theta[:10, equator_idx]**2).mean()
-            topology_ratio = pole_field / equator_field if equator_field > 0 else 1
-            
-            # Classification logic
-            if field_reversal and topology_ratio < 2.0:
-                return "Dipole"
-            elif not field_reversal and topology_ratio > 1.5:
-                return "Monopole"
-            else:
-                return "Mixed/Evolving"
+            # Use Legendre decomposition for proper classification
+            try:
+                legendre_results = self.analyze_field_multipoles_legendre()
+                field_type = legendre_results['field_type']
+                
+                # Map Legendre field types to simpler names for plot titles
+                type_map = {
+                    "Regular Monopole": "Monopole",
+                    "Pure Dipole": "Dipole",
+                    "Split Monopole": "Split Monopole",
+                    "Quadrupole": "Quadrupole",
+                    "Mixed Multipole": "Mixed/Evolving"
+                }
+                
+                # Also handle "Higher Multipole (l=X)" case
+                if "Higher Multipole" in field_type:
+                    return "Mixed/Evolving"
+                
+                return type_map.get(field_type, "Mixed/Evolving")
+                
+            except Exception as e:
+                print(f"Legendre classification failed, using fallback: {e}")
+                # Fallback to simple heuristic if Legendre fails
+                return self._detect_field_type_fallback(B_r)
                 
         except Exception as e:
             print(f"Could not detect field type: {e}")
             return "Unknown"
+
+
+    def _detect_field_type_fallback(self, B_r):
+        """
+        Fallback heuristic if Legendre decomposition fails.
+        More lenient thresholds than before.
+        """
+        n_theta = B_r.shape[1]
+        north_quarter = n_theta // 4
+        south_quarter = 3 * n_theta // 4
+        equator_idx = n_theta // 2
+        
+        # Average field in northern and southern hemispheres
+        B_r_north = B_r[:10, :north_quarter].mean()
+        B_r_south = B_r[:10, south_quarter:].mean()
+        
+        # Check for field reversal (dipole signature)
+        field_reversal = (B_r_north * B_r_south < 0)
+        
+        # Check pole/equator ratio
+        B_theta = hs.B[2].squeeze()
+        pole_field = np.sqrt(B_r[:10, 0]**2 + B_theta[:10, 0]**2).mean()
+        equator_field = np.sqrt(B_r[:10, equator_idx]**2 + B_theta[:10, equator_idx]**2).mean()
+        topology_ratio = pole_field / equator_field if equator_field > 0 else 1
+        
+        # More lenient classification logic
+        if field_reversal:
+            return "Dipole"
+        elif topology_ratio > 1.2:  # Reduced from 1.5
+            return "Monopole"
+        else:
+            return "Mixed/Evolving"
 
     def calculate_magnetization(self):
         """Calculate magnetization parameter sigma = b^2/(4π*rho*c^2) = bsq/rho"""
@@ -658,50 +690,81 @@ class MagnetizedAnalysis:
             normalized_coefficients = coefficients
         
         # ============================================================
-        # CLASSIFY FIELD TYPE USING LEGENDRE DECOMPOSITION
+        # IMPROVED CLASSIFICATION LOGIC (INTEGRATED VERSION)
         # ============================================================
-        
-        # Thresholds for classification
-        monopole_threshold = 10.0  # a_0 must be 10x larger than others
-        dominance_threshold = 5.0   # Dominant mode must be 5x larger
-        
+
+        abs_coefficients = np.abs(coefficients)
+        dominant_order = np.argmax(abs_coefficients)
+
         a0 = abs_coefficients[0]
-        a1 = abs_coefficients[1]
-        a2 = abs_coefficients[2] if max_order >= 2 else 0
-        
-        max_other = np.max(abs_coefficients[1:]) if len(abs_coefficients) > 1 else 0
-        
-        # Classification logic based on tutor's explanation
-        if dominant_order == 0 and a0 > monopole_threshold * max_other:
+        a1 = abs_coefficients[1] if len(abs_coefficients) > 1 else 0
+        a2 = abs_coefficients[2] if len(abs_coefficients) > 2 else 0
+
+        # Compute dominance measures
+        sorted_coeffs = np.sort(abs_coefficients)[::-1]
+        second_largest = sorted_coeffs[1] if len(sorted_coeffs) > 1 else 0
+        third_largest = sorted_coeffs[2] if len(sorted_coeffs) > 2 else 0
+
+        strong_dominance = 3.0
+        moderate_dominance = 1.5
+
+        # Total power
+        total_power = np.sum(abs_coefficients**2)
+        power_fraction_threshold = 0.6
+        dominant_power_fraction = abs_coefficients[dominant_order]**2 / total_power if total_power > 0 else 0
+
+        # ============================================================
+        # CLASSIFICATION
+        # ============================================================
+
+        if dominant_order == 0 and dominant_power_fraction > power_fraction_threshold:
             field_type = "Regular Monopole"
             confidence = "High"
-            description = f"l=0 (monopole) dominates: a₀={a0:.3e} >> others"
-            
-        elif dominant_order == 1 and a1 > dominance_threshold * a0 and even_odd_ratio < 0.3:
+            description = f"l=0 (monopole) dominates: a₀={a0:.3e}, {dominant_power_fraction*100:.1f}% of power"
+
+        elif dominant_order == 0 and a0 > strong_dominance * second_largest and even_odd_ratio > 3.0:
+            field_type = "Regular Monopole"
+            confidence = "High"
+            description = f"l=0 (monopole) dominates: a₀={a0:.3e} >> others, even/odd={even_odd_ratio:.2f}"
+
+        elif dominant_order == 1 and dominant_power_fraction > power_fraction_threshold:
             field_type = "Pure Dipole"
             confidence = "High"
-            description = f"l=1 (dipole) dominates: a₁={a1:.3e}, even_power << odd_power"
-            
-        elif 0.3 <= even_odd_ratio <= 3.0 and a0 > 0.1 * a1 and a1 > 0.1 * a0:
-            # Split monopole: both even and odd contribute significantly
+            description = f"l=1 (dipole) dominates: a₁={a1:.3e}, {dominant_power_fraction*100:.1f}% of power"
+
+        elif dominant_order == 1 and a1 > strong_dominance * a0 and a1 > strong_dominance * a2:
+            field_type = "Pure Dipole"
+            confidence = "High"
+            description = f"l=1 (dipole) dominates: a₁={a1:.3e} >> a₀={a0:.3e}"
+
+        elif dominant_order == 1 and a1 > moderate_dominance * max(a0, a2) and even_odd_ratio < 0.5:
+            field_type = "Pure Dipole"
+            confidence = "Medium"
+            description = f"l=1 (dipole) dominates: a₁={a1:.3e}, even/odd={even_odd_ratio:.2f}"
+
+        elif (dominant_order in [0, 1] and 
+            0.3 <= even_odd_ratio <= 3.0 and
+            a0 > 0.2 * a1 and a1 > 0.2 * a0):
             field_type = "Split Monopole"
             confidence = "High" if 0.5 <= even_odd_ratio <= 2.0 else "Medium"
-            description = f"Even and odd orders both significant: even/odd={even_odd_ratio:.2f}"
-            
-        elif dominant_order == 2 and a2 > dominance_threshold * max(a0, a1):
+            description = f"Both even and odd significant: a₀={a0:.3e}, a₁={a1:.3e}, ratio={even_odd_ratio:.2f}"
+
+        elif dominant_order == 2 and a2 > strong_dominance * max(a0, a1):
             field_type = "Quadrupole"
             confidence = "High"
             description = f"l=2 (quadrupole) dominates: a₂={a2:.3e}"
-            
-        elif dominant_order > 2:
+
+        elif dominant_order > 2 and dominant_power_fraction > 0.4:
             field_type = f"Higher Multipole (l={dominant_order})"
             confidence = "Medium"
-            description = f"l={dominant_order} is dominant order"
-            
+            description = f"l={dominant_order} is dominant: {dominant_power_fraction*100:.1f}% of power"
+
         else:
             field_type = "Mixed Multipole"
             confidence = "Low"
-            description = "No single multipole clearly dominates"
+            top_3 = f"a₀={a0:.2e}, a₁={a1:.2e}, a₂={a2:.2e}"
+            description = f"No clear dominant: {top_3}, even/odd={even_odd_ratio:.2f}"
+
         
         # Reconstruct B_r from Legendre expansion (for validation)
         B_r_reconstructed = np.zeros_like(B_r_horizon)
@@ -1726,6 +1789,8 @@ class MagnetizedAnalysis:
         title_map = {
             "Monopole": "2D BZ Monopole Magnetosphere: Quantitative Analysis",
             "Dipole": "2D BZ Dipole Magnetosphere: Quantitative Analysis",
+            "Split Monopole": "2D BZ Split Monopole Magnetosphere: Quantitative Analysis",  # NEW!
+            "Quadrupole": "2D BZ Quadrupole Magnetosphere: Quantitative Analysis",  # NEW!
             "Mixed/Evolving": "2D BZ Evolving Magnetosphere: Quantitative Analysis", 
             "Unknown": "2D BZ Magnetosphere: Quantitative Analysis"
         }

@@ -1755,7 +1755,7 @@ class MagnetizedAnalysis:
 
     Black Hole Properties:
     Horizon radius = {latest_omega['horizon_radius']:.3f} rg
-    Spin parameter a â‰ˆ {hs.a:.3f}
+    Spin parameter a ≈ {hs.a:.3f}
 
     Analysis Coverage:
     Time span: {results['times'][0]:.1f} - {results['times'][-1]:.1f} M

@@ -1392,7 +1392,7 @@ class MagnetizedAnalysis:
             ax2.set_title('Frame Dragging Efficiency', fontsize=14, pad=15)
             ax2.grid(True, alpha=0.3)
             ax2.tick_params(labelsize=12)
-            ax2.legend(fontsize=11)
+            ax2.legend(fontsize=11, loc='best')
             
             # FIXED: Report precise values
             final_omega = results['omega_ratios'][-1]
@@ -1650,7 +1650,7 @@ class MagnetizedAnalysis:
                         fontsize=11, verticalalignment='top', fontfamily='monospace',
                         bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9))
                 
-                ax3.legend(loc='upper right', fontsize=10)
+                ax3.legend(loc='best', fontsize=10)
             else:
                 # 1D case
                 deviation_percent = abs(omega_ratio - 0.5) / 0.5 * 100
@@ -1972,7 +1972,7 @@ class MagnetizedAnalysis:
                    fontsize=11, verticalalignment='top', fontfamily='monospace',
                    bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9))
             
-            ax.legend(loc='upper right', fontsize=11)
+            ax.legend(loc='best', fontsize=11)
         
         # Create animation
         ani = animation.FuncAnimation(fig, update, frames=len(omega_profiles),
@@ -2452,7 +2452,7 @@ class MagnetizedAnalysis:
                 Line2D([0], [0], marker='>', color='w', markerfacecolor='lightgray',
                     markeredgecolor='gray', markersize=10, label='Outward (ur≥0)')
             ]
-            ax2.legend(handles=legend_elements, loc='upper right', fontsize=9, framealpha=0.9)
+            ax2.legend(handles=legend_elements, loc='best', fontsize=9, framealpha=0.9)
             
             ax2.set_title(f'Flow Direction | t={current_time:.1f}M',
                         fontsize=12, fontweight='bold', pad=8)
@@ -3390,9 +3390,9 @@ class MagnetizedAnalysis:
                 
                 # Plot dominant multipole order
                 line1 = ax3.plot(topo_times, dominant_orders, 'b-', linewidth=2, 
-                               marker='o', markersize=6, label='Dominant ℓ', alpha=0.8)
+                               marker='o', markersize=6, label='Dominant l', alpha=0.8)
                 ax3.set_xlabel('Time (M)', fontsize=12)
-                ax3.set_ylabel('Dominant Multipole Order ℓ', fontsize=12, color='b')
+                ax3.set_ylabel('Dominant Multipole Order l', fontsize=12, color='b')
                 ax3.tick_params(axis='y', labelcolor='b')
                 ax3.set_ylim(-0.5, max(dominant_orders) + 0.5 if dominant_orders else 5)
                 
@@ -3407,9 +3407,9 @@ class MagnetizedAnalysis:
                 ax3.grid(True, alpha=0.3)
                 
                 # Add horizontal reference lines for multipole orders
-                for l, label, color in [(0, 'Monopole (ℓ=0)', 'blue'), 
-                                        (1, 'Dipole (ℓ=1)', 'orange'), 
-                                        (2, 'Quadrupole (ℓ=2)', 'green')]:
+                for l, label, color in [(0, 'Monopole (l=0)', 'blue'), 
+                                        (1, 'Dipole (l=1)', 'orange'), 
+                                        (2, 'Quadrupole (l=2)', 'green')]:
                     ax3.axhline(y=l, color=color, linestyle='--', alpha=0.2, linewidth=1.5)
                     ax3.text(times[-1]*0.02, l, f' {label}', fontsize=8, va='center', color=color, alpha=0.7)
                 
@@ -3417,7 +3417,7 @@ class MagnetizedAnalysis:
                 final_topo = results['topology_evolution'][-1]
                 if final_topo:
                     topo_text = f'{final_topo["field_type"]}\n'
-                    topo_text += f'ℓ = {final_topo["dominant_order"]}\n'
+                    topo_text += f'l = {final_topo["dominant_order"]}\n'
                     # Handle confidence as either float or string
                     try:
                         conf_val = float(final_topo["confidence"])
@@ -3536,7 +3536,7 @@ class MagnetizedAnalysis:
             final_topo = results['topology_evolution'][-1]
             if final_topo:
                 # Use Legendre-based metrics instead of n_crossings
-                summary_text += f"Dominant ℓ: {final_topo['dominant_order']}\n"
+                summary_text += f"Dominant l: {final_topo['dominant_order']}\n"
                 summary_text += f"Type: {final_topo['field_type']}\n"
                 # Handle confidence as either float or string
                 try:
@@ -3655,7 +3655,6 @@ def handle_animation_requests(analyzer, args, dump_files):
     """
     Handle all animation-related requests
     Returns True if handled (should exit), False otherwise
-    # TODO: add frame dragging animation, add comprehensive "show all animations" for bz problems
     """
     if args.animations:
         print("\n=== GENERATING ALL ANIMATIONS ===")

@@ -1,1050 +1,966 @@
-import harm_script as hs  # Import harm_script to access its functions and variables
-import matplotlib.pyplot as plt  # For plotting
+import harm_script as hs
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server/cluster use
+import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np
 import os
 import argparse
-from matplotlib.colors import LogNorm  # For LogNorm color scaling
-from harm_script import plc
+from matplotlib.colors import LogNorm
+from matplotlib.lines import Line2D
+import glob
 
+# =============================================================================
+# GLOBAL CONSTANTS
+# =============================================================================
+GAMMA = 5./3.           # Adiabatic index
+R_IN = 2.0              # Initial boundary (r_g) - FIXED from 10.0
+R_SONIC_THEORY_BONDI = 5.0    # Theoretical sonic radius for pure Bondi (γ=5/3)
 
-# Load grid and simulation data for multiple dump files
-def load_data(grid_file, dump_file, cache={}):
-    if "grid" not in cache:
-        hs.rg(grid_file)
-        cache["grid"] = True
-        print(f"Loaded grid from {grid_file}.")
-    hs.rd(dump_file)
-    print(f"Loaded data from {dump_file}.")
-    print(f"Simulation time: {hs.t:.6f}")
+# BHL theoretical parameters (from init.c)
+V_Z_WIND = 0.1          # Wind velocity
+C_S_INF = np.sqrt(0.2)  # Sound speed at infinity
+R_ACC_BHL = 1.0 / (C_S_INF**2 + V_Z_WIND**2)  # BHL accretion radius ≈ 4.76
+R_SONIC_THEORY = R_SONIC_THEORY_BONDI  # Default to Bondi value 
 
+# =============================================================================
+# BONDI ANALYSIS CLASS
+# =============================================================================
 
-def analyze_bondi_acc(dump_files, dim=1, cache={}):
-    sonic_surface_results = []
-    all_radii = []
-    all_rho = []
-    all_times = []
-    sonic_radii_over_time = []
-
-    for dump_file in dump_files:
-        try:
-            load_data("gdump", dump_file, cache=cache)
-            r = hs.r.squeeze()
-            rho = hs.rho.squeeze()
-            v1p = hs.v1p.squeeze()
-
-            if dim == 2:
-                rho = rho.mean(axis=1)
-                r = r[:, 0]
-                v1p = v1p.mean(axis=1)
-
-            sonic_surface_index = (v1p[:-1] * v1p[1:] < 0).nonzero()[0]
-
-            if len(sonic_surface_index) > 0:
-                sonic_radius = r[sonic_surface_index[0]]
-                sonic_surface_results.append((dump_file, float(sonic_radius)))
-                print(f"Sonic surface detected at radius r = {float(sonic_radius):.6f} for {dump_file}")
-            else:
-                sonic_radius = None
-                sonic_surface_results.append((dump_file, None))
-                print(f"Sonic surface not detected for {dump_file}")
-
-            all_radii.append(r)
-            all_rho.append(rho)
-            all_times.append(hs.t)
-            sonic_radii_over_time.append(sonic_radius)
-
-        except Exception as e:
-            print(f"An error occurred while analyzing {dump_file}: {e}")
-
-    if all_times:
-        plot_density_profiles(all_radii, all_rho, all_times, sonic_surface_results, dim)
-
-    if sonic_radii_over_time and all_times:
-        plot_sonic_surface_evolution(all_times, sonic_radii_over_time)
-
-    return sonic_surface_results
-
-
-# Plot density profiles
-def plot_density_profiles(all_radii, all_rho, all_times, sonic_surface_results, dim, savefig=False, filename=None, show=True):
-    plt.figure(figsize=(10, 6))
-    ax = plt.gca()
-    colormap = plt.cm.viridis
-    norm = plt.Normalize(min(all_times), max(all_times))
-
-    for i, (r, rho) in enumerate(zip(all_radii, all_rho)):
-        color = colormap(norm(all_times[i]))
-        ax.loglog(r, rho, label=f"t = {all_times[i]:.2f}", color=color)
-        if sonic_surface_results[i][1] is not None:
-            idx = np.abs(r - sonic_surface_results[i][1]).argmin()
-            ax.plot(sonic_surface_results[i][1], rho[idx],
-                    'o', color=color, markersize=6, label=f"Sonic Surface at t = {all_times[i]:.2f}")
-
-    sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
-    sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax)
-    cbar.set_label('Time')
-
-    ax.set_xlabel("Radius (r)")
-    ax.set_ylabel("Density (rho)")
-    ax.set_title(f"Density Profiles with Sonic Surfaces (Time Evolution) - {dim}D")
-    ax.grid(True)
-
-    if savefig and filename:
-        plt.savefig(filename)
-        print(f"Plot saved as {filename}")
-
-    if show:
-        plt.show()
-    plt.close()
-
-
-# Plot sonic surface evolution over time
-def plot_sonic_surface_evolution(times, sonic_radii):
-    plt.figure(figsize=(10, 6))
-    plt.plot(times, sonic_radii, marker='o', linestyle='None', color='b', label="Sonic Radius")
-    plt.xlabel("Time (t)")
-    plt.ylabel("Sonic Radius (r)")
-    plt.title("Sonic Surface Evolution Over Time")
-    plt.grid(True)
-    plt.legend()
-    plt.show()
-
-
-# Compute Cartesian coordinates
-def compute_cartesian_coordinates():
-    r = hs.r.squeeze()
-    theta = hs.h.squeeze()
-    x = r * np.sin(theta)
-    y = r * np.cos(theta)
-    return x, y
-
-
-# Original density animation function (unchanged from old version)
-def animate_density_distribution(grid_file, dump_files, output_file="bondi_density.mp4", fps=10):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    
-    # Load first frame to set up the plot structure
-    load_data(grid_file, dump_files[0])
-    rho = hs.rho.squeeze()
-    x, y = compute_cartesian_coordinates()
-    rho_masked = np.ma.masked_less_equal(rho, 0)
-    
-    # Find global min/max across all frames for consistent scaling
-    global_min = float('inf')
-    global_max = float('-inf')
-    
-    print("Computing global density range...")
-    for i, dump_file in enumerate(dump_files[::10]):  # Sample every 10th file for speed
-        load_data(grid_file, dump_file)
-        rho_temp = hs.rho.squeeze()
-        rho_temp_masked = rho_temp[rho_temp > 0]  # Only positive values
-        if len(rho_temp_masked) > 0:
-            global_min = min(global_min, rho_temp_masked.min())
-            global_max = max(global_max, rho_temp_masked.max())
-    
-    print(f"Global density range: {global_min:.2e} to {global_max:.2e}")
-    
-    # Create initial plot with global scaling
-    pcm = ax.pcolormesh(
-        x, y, rho_masked,
-        shading='auto', cmap='viridis',
-        norm=LogNorm(vmin=global_min, vmax=global_max)
-    )
-    cbar = fig.colorbar(pcm, ax=ax, label="Density (log scale)")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_aspect('equal')
-    title = ax.set_title(f"2D Density Distribution at t = {hs.t:.3f}")
-
-    def update(frame):
-        dump_file = dump_files[frame]
-        load_data(grid_file, dump_file)
-        rho = hs.rho.squeeze()
-        print(f"Frame {frame}: density min={rho.min():.2e}, max={rho.max():.2e}, time={hs.t:.3f}")
-        
-        rho_masked = np.ma.masked_less_equal(rho, 0)
-        pcm.set_array(rho_masked.ravel())
-        # Keep the global normalization - this ensures consistent color scaling
-        title.set_text(f"2D Density Distribution at t = {hs.t:.3f}")
-        return pcm, title
-
-    ani = animation.FuncAnimation(fig, update, frames=len(dump_files), blit=False, interval=100)
-    ani.save(output_file, writer='ffmpeg', fps=fps)
-    print(f"Saved density animation to {output_file}")
-    plt.close(fig)
-
-
-# Original contour animation function (unchanged from old version)
-def animate_density_contours(grid_file, dump_files, levels=20, output_file="bondi_density_contours.mp4", fps=10):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    
-    # Find global density range for consistent scaling
-    global_min = float('inf')
-    global_max = float('-inf')
-    
-    print("Computing global density range for contours...")
-    for dump_file in dump_files[::10]:  # Sample every 10th file
-        load_data(grid_file, dump_file)
-        rho = hs.rho.squeeze()
-        positive_rho = rho[rho > 0]
-        if len(positive_rho) > 0:
-            global_min = min(global_min, positive_rho.min())
-            global_max = max(global_max, positive_rho.max())
-    
-    # Set up coordinate system
-    load_data(grid_file, dump_files[0])
-    r, z = compute_cartesian_coordinates()
-    
-    # Create level values that will be consistent across frames
-    log_levels = np.logspace(np.log10(global_min), np.log10(global_max), levels)
-    
-    def update(frame):
-        ax.clear()  # Clear the entire axes for each frame
-        
-        dump_file = dump_files[frame]
-        load_data(grid_file, dump_file)
-        rho = hs.rho.squeeze()
-        
-        # Create contour plot with consistent levels
-        contours = ax.contourf(r, z, rho, levels=log_levels, cmap='viridis', 
-                              norm=LogNorm(vmin=global_min, vmax=global_max), extend='both')
-        
-        ax.set_xlabel("R")
-        ax.set_ylabel("z")
-        ax.set_title(f"Density Contours at t = {hs.t:.3f}")
-        ax.set_aspect('equal')
-        
-        return []
-
-    # Create initial plot for colorbar
-    load_data(grid_file, dump_files[0])
-    rho = hs.rho.squeeze()
-    contours = ax.contourf(r, z, rho, levels=log_levels, cmap='viridis',
-                          norm=LogNorm(vmin=global_min, vmax=global_max), extend='both')
-    cbar = fig.colorbar(contours, ax=ax, label='Density (log scale)')
-
-    ani = animation.FuncAnimation(fig, update, frames=len(dump_files), blit=False, interval=100)
-    ani.save(output_file, writer='ffmpeg', fps=fps)
-    print(f"Saved density contour animation to {output_file}")
-    plt.close(fig)
-
-
-# Enhanced 2D sonic radius analysis function
-def analyze_2d_sonic_surface(dump_files, cache={}, debug=False):
+class BondiAnalysis:
     """
-    Analyze sonic surface in 2D - track min, max, and average sonic radii
-    FIXED: Now properly collects times from each dump file
+    Comprehensive Bondi accretion analysis class.
+    Handles 1D and 2D scenarios with proper coordinate transformations.
+    
+    CRITICAL: This class expects to be run from ~/harmpi directory with
+    a 'dumps' symlink pointing to the data folder.
     """
-    sonic_analysis_results = []
+    def __init__(self, output_dir="./bondi_plots"):
+        self.output_dir = output_dir
+        self.cache = {}
+        os.makedirs(output_dir, exist_ok=True)
     
-    if debug:
-        print("=== SONIC SURFACE ANALYSIS DEBUG ===")
+    def load_data(self, grid_file, dump_file):
+        """
+        Load grid and dump data.
+        
+        CRITICAL: Pass BARE filenames only! harm_script automatically 
+        prepends "dumps/" to all paths.
+        
+        Args:
+            grid_file: Usually "gdump" (NOT "dumps/gdump")
+            dump_file: e.g. "dump000" (NOT "dumps/dump000")
+        """
+        # Load grid only once
+        if "grid" not in self.cache:
+            hs.rg(grid_file)  # harm_script looks for dumps/gdump
+            self.cache["grid"] = True
+        
+        # Load dump file
+        hs.rd(dump_file)  # harm_script looks for dumps/dump000
+        return hs.t
+
+
+    def mirror_domain(self, r, theta, data):
+        """
+        Mirror the axisymmetric data to create full circle visualization.
+        
+        Parameters:
+        -----------
+        r : array
+            Radial coordinate (nx, ny)
+        theta : array
+            Theta coordinate (nx, ny)  
+        data : array
+            Data to mirror (nx, ny)
+            
+        Returns:
+        --------
+        x_full, z_full, data_full : mirrored arrays
+        """
+        x = r * np.sin(theta)
+        z = r * np.cos(theta)
+        
+        # Mirror across the midplane
+        x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+        z_full = np.concatenate([z[:, ::-1], z], axis=1)
+        data_full = np.concatenate([data[:, ::-1], data], axis=1)
+        
+        return x_full, z_full, data_full
+
+    # =========================================================================
+    # 1D ANALYSIS & DOCUMENTATION
+    # =========================================================================
     
-    for i, dump_file in enumerate(dump_files):
-        try:
-            # Load data for this specific dump file
-            load_data("gdump", dump_file, cache=cache)
-            
-            # NOW hs.t contains the correct time for this dump file
-            current_time = float(hs.t)  # Capture the time immediately after loading
-            
-            if debug and i < 5:  # Debug first 5 files
-                print(f"\n{dump_file}:")
-                print(f"  Time: {current_time}")
-                print(f"  Grid shape: r={hs.r.shape}, v1p={hs.v1p.shape}")
+    def analyze_1d_sonic_surface(self, dump_files):
+        """
+        Analyze sonic surface in 1D with full documentation.
+        
+        Returns:
+            list: Results with time, r_sonic, mach_number for each dump
+        """
+        results = []
+        
+        for dump_file in dump_files:
+            t = self.load_data("gdump", dump_file)
             
             r = hs.r.squeeze()
             v1p = hs.v1p.squeeze()
             
-            # Find sonic surface for each theta slice
-            sonic_radii_at_angles = []
-            upstream_sonic_r = None
-            downstream_sonic_r = None
+            # Calculate sound speed (documented)
+            P = hs.pg.squeeze()
+            rho = hs.rho.squeeze()
+            c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
             
-            # Check middle slice for debugging
-            if debug and i < 3:
-                mid_j = r.shape[1] // 2
-                r_slice = r[:, mid_j]
-                v1p_slice = v1p[:, mid_j]
-                print(f"  Mid-slice v1p range: {v1p_slice.min():.6f} to {v1p_slice.max():.6f}")
-                sign_changes = np.where(v1p_slice[:-1] * v1p_slice[1:] < 0)[0]
-                print(f"  Sign changes in mid-slice: {len(sign_changes)} at indices {sign_changes}")
+            # Method: Find where Mach ≈ 1
+            mach = np.abs(v1p) / c_s
+            sonic_idx = np.argmin(np.abs(mach - 1.0))
             
-            n_theta = r.shape[1]
-            for j in range(r.shape[1]):  # Loop over theta direction
-                r_slice = r[:, j]
-                v1p_slice = v1p[:, j]
-                
-                # Find where v1p changes sign (sonic point)
-                sign_changes = np.where(v1p_slice[:-1] * v1p_slice[1:] < 0)[0]
-                
-                if len(sign_changes) > 0:
-                    # Take the first sign change (closest to BH)
-                    sonic_idx = sign_changes[0]
-                    sonic_r = r_slice[sonic_idx]
-                    sonic_radii_at_angles.append(sonic_r)
-                    
-                    # Add upstream/downstream tracking
-                    theta_fraction = j / n_theta
-                    if theta_fraction < 0.25:  # "Upstream" region
-                        if upstream_sonic_r is None or sonic_r < upstream_sonic_r:
-                            upstream_sonic_r = sonic_r
-                    elif theta_fraction > 0.75:  # "Downstream" region  
-                        if downstream_sonic_r is None or sonic_r > downstream_sonic_r:
-                            downstream_sonic_r = sonic_r
-            
-            if len(sonic_radii_at_angles) > 0:
-                min_sonic_r = min(sonic_radii_at_angles)
-                max_sonic_r = max(sonic_radii_at_angles)
-                avg_sonic_r = np.mean(sonic_radii_at_angles)
-                
-                result = {
-                    'dump_file': dump_file,
-                    'time': current_time,  # Use the captured time
-                    'min_sonic_r': min_sonic_r,
-                    'max_sonic_r': max_sonic_r,
-                    'avg_sonic_r': avg_sonic_r,
-                    'upstream_sonic_r': upstream_sonic_r,
-                    'downstream_sonic_r': downstream_sonic_r,
-                    'all_sonic_r': sonic_radii_at_angles
-                }
-                
-                print(f"{dump_file}: t={current_time:.3f}, sonic r: min={min_sonic_r:.3f}, max={max_sonic_r:.3f}, avg={avg_sonic_r:.3f}")
-            else:
-                result = {
-                    'dump_file': dump_file,
-                    'time': current_time,  # Use the captured time
-                    'min_sonic_r': None,
-                    'max_sonic_r': None,
-                    'avg_sonic_r': None,
-                    'upstream_sonic_r': None,
-                    'downstream_sonic_r': None,
-                    'all_sonic_r': []
-                }
-                print(f"{dump_file}: t={current_time:.3f}, No sonic surface detected")
-            
-            sonic_analysis_results.append(result)
-            
-        except Exception as e:
-            print(f"Error analyzing {dump_file}: {e}")
+            results.append({
+                'time': t,
+                'r_sonic': float(r[sonic_idx]),
+                'mach': float(mach[sonic_idx]),
+                'dump': dump_file
+            })
+        
+        return results
     
-    return sonic_analysis_results
-
-
-# Plot 2D sonic radius evolution
-def plot_2d_sonic_evolution(sonic_analysis_results, title_suffix=""):
-    """
-    Plot min, max, and average sonic radii over time
-    Updated to work with the corrected data structure
-    """
-    # Extract data, filtering out None values
-    valid_results = [r for r in sonic_analysis_results if r['avg_sonic_r'] is not None]
-    
-    if not valid_results:
-        print("No valid sonic surface data found!")
-        return
-    
-    times = [r['time'] for r in valid_results]
-    min_radii = [r['min_sonic_r'] for r in valid_results]
-    max_radii = [r['max_sonic_r'] for r in valid_results]
-    avg_radii = [r['avg_sonic_r'] for r in valid_results]
-    
-    print(f"Plotting {len(times)} data points from t={min(times):.3f} to t={max(times):.3f}")
-    
-    plt.figure(figsize=(12, 8))
-    
-    plt.subplot(2, 1, 1)
-    plt.plot(times, min_radii, 'b-', label='Min Sonic Radius', alpha=0.7)
-    plt.plot(times, max_radii, 'r-', label='Max Sonic Radius', alpha=0.7)
-    plt.plot(times, avg_radii, 'g-', label='Average Sonic Radius', linewidth=2)
-    plt.fill_between(times, min_radii, max_radii, alpha=0.2, color='gray', label='Sonic Surface Range')
-    
-    # Add upstream/downstream if available
-    upstream_radii = [r['upstream_sonic_r'] for r in valid_results if r['upstream_sonic_r'] is not None]
-    downstream_radii = [r['downstream_sonic_r'] for r in valid_results if r['downstream_sonic_r'] is not None]
-    upstream_times = [r['time'] for r in valid_results if r['upstream_sonic_r'] is not None]
-    downstream_times = [r['time'] for r in valid_results if r['downstream_sonic_r'] is not None]
-    
-    if upstream_radii:
-        plt.plot(upstream_times, upstream_radii, 'b--', alpha=0.8, linewidth=2, label='Upstream Sonic Radius')
-    if downstream_radii:
-        plt.plot(downstream_times, downstream_radii, 'r--', alpha=0.8, linewidth=2, label='Downstream Sonic Radius')
-    
-    plt.xlabel('Time')
-    plt.ylabel('Sonic Radius')
-    plt.title(f'2D Sonic Surface Evolution {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    
-    # Plot sonic surface shape variation over time
-    plt.subplot(2, 1, 2)
-    shape_variation = [(max_r - min_r) / avg_r if avg_r > 0 else 0 
-                      for min_r, max_r, avg_r in zip(min_radii, max_radii, avg_radii)]
-    plt.plot(times, shape_variation, 'purple', linewidth=2)
-    plt.xlabel('Time')
-    plt.ylabel('(R_max - R_min) / R_avg')
-    plt.title(f'Sonic Surface Shape Deviation from Spherical {title_suffix}')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-
-
-# Plot Sonic Surface with plc overlaying Mach contour
-def plot_sonic_surface(grid_file, dump_file, savefig=False, filename=None, show=True):
-    try:
-        load_data(grid_file, dump_file)
-        rho = hs.rho.squeeze()
-        vx = hs.v1p.squeeze()
-        vy = hs.v2p.squeeze()
-
-        cs = np.sqrt(4.0 / 3.0 * (rho ** (4.0 / 3.0 - 1)))
-        v = np.sqrt(vx**2 + vy**2)
-        mach = v / cs
-
-        plc(rho, xy=1, cb=1, isfilled=1, cmap="viridis")
-        x, y = compute_cartesian_coordinates()
-        plt.contour(x, y, mach, levels=[1], colors="red", linewidths=2, linestyles="--")
-        plt.title(f"Sonic Surface (Mach=1) at t = {hs.t:.2f}")
-
-        if savefig and filename:
-            plt.savefig(filename)
-            print(f"Sonic surface plot saved as {filename}")
-
-        if show:
-            plt.show()
-
-    except Exception as e:
-        print(f"Error in plot_sonic_surface with plc: {e}")
-
-
-# Plot Velocity Fields (unchanged)
-def plot_velocity_field(grid_file, dump_file, savefig=False, filename=None, show=True):
-    try:
-        load_data(grid_file, dump_file)
-        rho = hs.rho.squeeze()
-        x, y = compute_cartesian_coordinates()
-        vx = hs.v1p.squeeze()
-        vy = hs.v2p.squeeze()
-
-        v_magnitude = np.sqrt(vx**2 + vy**2)
-
-        skip = (slice(None, None, 5), slice(None, None, 5))
-        x_downsampled, y_downsampled = x[skip], y[skip]
-        vx_downsampled, vy_downsampled = vx[skip], vy[skip]
-        v_magnitude_downsampled = v_magnitude[skip]
-
-        plt.clf()
-        q = plt.quiver(
-            x_downsampled, y_downsampled, vx_downsampled, vy_downsampled,
-            v_magnitude_downsampled, cmap='viridis', scale=20, headwidth=5, alpha=0.8
-        )
-        cbar = plt.colorbar(q)
-        cbar.set_label("Velocity Magnitude")
-
-        plt.xlabel("X")
-        plt.ylabel("Y")
-        plt.title(f"Velocity Field at t = {hs.t:.2f}")
-
-        if savefig and filename:
-            plt.savefig(filename)
-            print(f"Velocity field plot saved as {filename}")
-
-        if show:
-            plt.show()
-
-    except Exception as e:
-        print(f"An error occurred while plotting velocity field for {dump_file}: {e}")
-
-
-# Wind velocity detection function
-def detect_wind_velocity(dump_files, cache={}, sample_size=5):
-    """
-    Detect if simulation has significant uniform velocity (wind)
-    """
-    total_vy = 0
-    count = 0
-    
-    # Sample a few files to detect wind
-    sample_files = dump_files[:sample_size] if len(dump_files) >= sample_size else dump_files
-    
-    for dump_file in sample_files:
-        try:
-            load_data("gdump", dump_file, cache=cache)
-            if hasattr(hs, 'vu') and len(hs.vu) > 2:
-                vy = hs.vu[2].squeeze()
-                total_vy += np.abs(vy).mean()
-                count += 1
-        except:
-            continue
-    
-    avg_vy = total_vy / count if count > 0 else 0
-    has_wind = avg_vy > 0.01  # Threshold for significant wind
-    
-    print(f"Average |v_theta|: {avg_vy:.4f} -> {'Wind detected' if has_wind else 'No wind (pure Bondi)'}")
-    return has_wind
-
-
-# Original velocity field animation with density overlay (from old version)
-def animate_density_with_velocity(grid_file, dump_files, output_file="bondi_density_velocity.mp4", fps=10, skip_factor=3):
-    """
-    Create animation showing density contours with velocity field overlay
-    """
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    # Find global ranges for consistent scaling
-    print("Computing global ranges for density+velocity animation...")
-    global_rho_min, global_rho_max = float('inf'), float('-inf')
-    global_v_max = 0
-    
-    sample_files = dump_files[::max(1, len(dump_files)//20)]
-    for dump_file in sample_files:
-        try:
-            load_data(grid_file, dump_file)
+    def plot_1d_density_profiles(self, dump_files, sonic_results):
+        """
+        Plot density profiles with initial conditions marked.
+        """
+        fig, ax = plt.subplots(figsize=(12, 7))
+        
+        # Color map
+        times = [r['time'] for r in sonic_results]
+        norm = plt.Normalize(min(times), max(times))
+        cmap = plt.cm.viridis
+        
+        for i, (dump_file, result) in enumerate(zip(dump_files, sonic_results)):
+            self.load_data("gdump", dump_file)
+            r = hs.r.squeeze()
             rho = hs.rho.squeeze()
             
-            # Use vu if available, otherwise fall back to v1p, v2p
-            if hasattr(hs, 'vu') and len(hs.vu) > 2:
-                vx, vy = hs.vu[1].squeeze(), hs.vu[2].squeeze()
-            else:
-                vx, vy = hs.v1p.squeeze(), hs.v2p.squeeze()
+            color = cmap(norm(result['time']))
+            ax.loglog(r, rho, alpha=0.7, color=color)
             
-            positive_rho = rho[rho > 0]
-            if len(positive_rho) > 0:
-                global_rho_min = min(global_rho_min, positive_rho.min())
-                global_rho_max = max(global_rho_max, positive_rho.max())
-            
-            v_mag = np.sqrt(vx**2 + vy**2)
-            global_v_max = max(global_v_max, v_mag.max())
-        except Exception as e:
-            print(f"Warning: Could not process {dump_file} for range calculation: {e}")
+            # Mark sonic point
+            if result['r_sonic']:
+                ax.axvline(result['r_sonic'], color=color, alpha=0.3, linestyle='--')
+        
+        # Mark initial boundary
+        ax.axvline(R_IN, color='red', linestyle=':', linewidth=2, 
+                  label=f'Initial boundary (r={R_IN})')
+        ax.axvline(R_SONIC_THEORY, color='orange', linestyle=':', linewidth=2,
+                  label=f'Theory sonic radius (r ≈ {R_SONIC_THEORY})')
+        
+        ax.set_xlabel('Radius (r_g)', fontsize=12)
+        ax.set_ylabel('Density', fontsize=12)
+        ax.set_title('1D Density Profiles Evolution', fontsize=14, weight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Add colorbar
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax, label='Time')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, "density_1d_profiles.png"), dpi=150)
+        plt.close()
     
-    print(f"Density range: {global_rho_min:.2e} to {global_rho_max:.2e}")
-    print(f"Max velocity: {global_v_max:.3f}")
+    def plot_1d_sonic_evolution(self, sonic_results):
+        """
+        Plot how sonic radius evolves over time.
+        """
+        times = [r['time'] for r in sonic_results]
+        r_sonic = [r['r_sonic'] for r in sonic_results]
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(times, r_sonic, 'b-', linewidth=2, label='Sonic radius')
+        ax.axhline(R_SONIC_THEORY, color='orange', linestyle='--', 
+                  label=f'Theory (γ=5/3): r ≈ {R_SONIC_THEORY}')
+        
+        ax.set_xlabel('Time (t/tg)', fontsize=12)
+        ax.set_ylabel('Sonic Radius (r_g)', fontsize=12)
+        ax.set_title('Sonic Surface Evolution (1D)', fontsize=14, weight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, "sonic_evolution_1d.png"), dpi=150)
+        plt.close()
     
-    # Set up coordinate system
-    load_data(grid_file, dump_files[0])
-    x, y = compute_cartesian_coordinates()
+    # =========================================================================
+    # 2D ANALYSIS
+    # =========================================================================
     
-    # Create density contour levels
-    rho_levels = np.logspace(np.log10(global_rho_min), np.log10(global_rho_max), 25)
-    
-    def update(frame):
-        ax.clear()
+    def analyze_2d_sonic_surface(self, dump_files):
+        """
+        Analyze 2D sonic surface tracking min, max, avg radii, 
+        plus upstream and downstream radii for BHL scenarios.
+        """
+        results = []
         
-        dump_file = dump_files[frame]
-        load_data(grid_file, dump_file)
-        
-        rho = hs.rho.squeeze()
-        
-        # Use available velocity data
-        if hasattr(hs, 'vu') and len(hs.vu) > 2:
-            vx, vy = hs.vu[1].squeeze(), hs.vu[2].squeeze()
-        else:
-            vx, vy = hs.v1p.squeeze(), hs.v2p.squeeze()
-        
-        v_mag = np.sqrt(vx**2 + vy**2)
-        
-        # Density contour plot
-        try:
-            contours = ax.contourf(x, y, rho, levels=rho_levels, cmap='viridis',
-                                  norm=LogNorm(vmin=global_rho_min, vmax=global_rho_max),
-                                  alpha=0.7, extend='both')
-        except:
-            # Fallback if LogNorm fails
-            contours = ax.contourf(x, y, rho, levels=25, cmap='viridis', alpha=0.7)
-        
-        # Velocity field overlay (downsampled)
-        skip = (slice(None, None, skip_factor), slice(None, None, skip_factor))
-        x_skip, y_skip = x[skip], y[skip]
-        vx_skip, vy_skip = vx[skip], vy[skip]
-        v_mag_skip = v_mag[skip]
-        
-        # Normalize arrows for better visibility
-        v_norm = np.sqrt(vx_skip**2 + vy_skip**2)
-        v_norm = np.where(v_norm > 0, v_norm, 1)  # Avoid division by zero
-        
-        # Only draw arrows where velocity is significant
-        significant_v = v_mag_skip > 0.01 * global_v_max
-        if np.any(significant_v):
-            quiver = ax.quiver(x_skip[significant_v], y_skip[significant_v], 
-                              (vx_skip/v_norm)[significant_v], (vy_skip/v_norm)[significant_v],
-                              v_mag_skip[significant_v], cmap='plasma', scale=30, headwidth=3,
-                              alpha=0.8, width=0.003)
-        
-        ax.set_xlabel("X", fontsize=14)
-        ax.set_ylabel("Z", fontsize=14)
-        ax.set_title(f"Density + Velocity Field at t = {hs.t:.3f}", fontsize=16)
-        ax.set_aspect('equal')
-        
-        # Set reasonable axis limits
-        max_extent = min(50, max(x.max(), y.max()) if x.size > 0 and y.size > 0 else 50)
-        ax.set_xlim(-max_extent, max_extent)
-        ax.set_ylim(-max_extent, max_extent)
-        
-        return []
-    
-    # Create colorbar using first frame
-    load_data(grid_file, dump_files[0])
-    rho = hs.rho.squeeze()
-    
-    try:
-        contours = ax.contourf(x, y, rho, levels=rho_levels, cmap='viridis',
-                              norm=LogNorm(vmin=global_rho_min, vmax=global_rho_max),
-                              alpha=0.7, extend='both')
-        cbar1 = fig.colorbar(contours, ax=ax, shrink=0.8, pad=0.15)
-        cbar1.set_label('Density (log scale)', fontsize=12)
-    except Exception as e:
-        print(f"Warning: Colorbar creation failed: {e}")
-    
-    ani = animation.FuncAnimation(fig, update, frames=len(dump_files),
-                                 blit=False, interval=100, repeat=True)
-    
-    try:
-        ani.save(output_file, writer='ffmpeg', fps=fps, dpi=100)
-        print(f"Saved density+velocity animation to {output_file}")
-    except Exception as e:
-        print(f"Error saving animation: {e}")
-        print("Make sure ffmpeg is installed: sudo apt install ffmpeg")
-    
-    plt.close(fig)
-
-
-# Enhanced sonic surface analysis with wind effects (from old version)
-def analyze_sonic_surface_with_wind(dump_files, cache={}, debug=False):
-    """
-    Enhanced sonic surface analysis that also tracks flow asymmetry
-    FIXED: Now properly collects times from each dump file
-    """
-    results = []
-    
-    for i, dump_file in enumerate(dump_files):
-        try:
-            load_data("gdump", dump_file, cache=cache)
-            current_time = float(hs.t)  # FIXED: Capture time immediately after loading
+        for dump_file in dump_files:
+            self.load_data("gdump", dump_file)
             
             r = hs.r.squeeze()
-            v1p = hs.v1p.squeeze()  # Radial velocity (lab frame)
+            v1p = hs.v1p.squeeze()
             
-            # Analyze sonic surface shape and location
-            sonic_radii_at_angles = []
+            # Find sonic point at each angle
+            sonic_radii = []
             upstream_sonic_r = None
             downstream_sonic_r = None
-            
             n_theta = r.shape[1]
+            
             for j in range(n_theta):
                 r_slice = r[:, j]
                 v1p_slice = v1p[:, j]
                 
-                # Find sonic points (where v1p changes sign)
+                # Find sign change (sonic point)
                 sign_changes = np.where(v1p_slice[:-1] * v1p_slice[1:] < 0)[0]
                 
                 if len(sign_changes) > 0:
                     sonic_r = r_slice[sign_changes[0]]
-                    sonic_radii_at_angles.append(sonic_r)
+                    sonic_radii.append(sonic_r)
                     
-                    # Track upstream vs downstream (simplified geometry)
+                    # Track upstream/downstream sonic radii
                     theta_fraction = j / n_theta
-                    if theta_fraction < 0.25:  # "Upstream" region
+                    if theta_fraction < 0.25:  # "Upstream" region (θ ~ 0, +z)
                         if upstream_sonic_r is None or sonic_r < upstream_sonic_r:
                             upstream_sonic_r = sonic_r
-                    elif theta_fraction > 0.75:  # "Downstream" region  
+                    elif theta_fraction > 0.75:  # "Downstream" region (θ ~ π, -z)
                         if downstream_sonic_r is None or sonic_r > downstream_sonic_r:
                             downstream_sonic_r = sonic_r
             
-            # Flow asymmetry metrics
-            if len(sonic_radii_at_angles) > 0:
-                min_sonic_r = min(sonic_radii_at_angles)
-                max_sonic_r = max(sonic_radii_at_angles)
-                avg_sonic_r = np.mean(sonic_radii_at_angles)
-                asymmetry = (max_sonic_r - min_sonic_r) / avg_sonic_r if avg_sonic_r > 0 else 0
-                
-                result = {
-                    'dump_file': dump_file,
-                    'time': current_time,
-                    'min_sonic_r': min_sonic_r,
-                    'max_sonic_r': max_sonic_r,
-                    'avg_sonic_r': avg_sonic_r,
-                    'asymmetry': asymmetry,
-                    'upstream_sonic_r': upstream_sonic_r,
-                    'downstream_sonic_r': downstream_sonic_r,
-                    'all_sonic_r': sonic_radii_at_angles
-                }
-                
-                if debug and i < 10:
-                    print(f"{dump_file}: t={current_time:.3f}, avg_sonic_r={avg_sonic_r:.3f}, asymmetry={asymmetry:.3f}")
+            if len(sonic_radii) > 0:
+                results.append({
+                    'time': float(hs.t),
+                    'min_r': float(np.min(sonic_radii)),
+                    'max_r': float(np.max(sonic_radii)),
+                    'avg_r': float(np.mean(sonic_radii)),
+                    'upstream_r': float(upstream_sonic_r) if upstream_sonic_r is not None else None,
+                    'downstream_r': float(downstream_sonic_r) if downstream_sonic_r is not None else None,
+                    'dump': dump_file
+                })
             else:
-                result = {
-                    'dump_file': dump_file,
-                    'time': current_time,
-                    'min_sonic_r': None,
-                    'max_sonic_r': None,
-                    'avg_sonic_r': None,
-                    'asymmetry': 0,
-                    'upstream_sonic_r': None,
-                    'downstream_sonic_r': None,
-                    'all_sonic_r': []
-                }
-            
-            results.append(result)
-            
+                results.append({
+                    'time': float(hs.t),
+                    'min_r': None,
+                    'max_r': None,
+                    'avg_r': None,
+                    'upstream_r': None,
+                    'downstream_r': None,
+                    'dump': dump_file
+                })
+        
+        return results
+    
+    def plot_2d_sonic_evolution(self, sonic_results, scenario=""):
+        """
+        Plot sonic surface statistics over time, including upstream/downstream
+        tracking for BHL scenarios.
+        """
+        times = [r['time'] for r in sonic_results if r['avg_r'] is not None]
+        min_r = [r['min_r'] for r in sonic_results if r['avg_r'] is not None]
+        max_r = [r['max_r'] for r in sonic_results if r['avg_r'] is not None]
+        avg_r = [r['avg_r'] for r in sonic_results if r['avg_r'] is not None]
+        
+        # Extract upstream/downstream data if available
+        upstream_times = [r['time'] for r in sonic_results if r.get('upstream_r') is not None]
+        upstream_r = [r['upstream_r'] for r in sonic_results if r.get('upstream_r') is not None]
+        downstream_times = [r['time'] for r in sonic_results if r.get('downstream_r') is not None]
+        downstream_r = [r['downstream_r'] for r in sonic_results if r.get('downstream_r') is not None]
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Main curves
+        ax.fill_between(times, min_r, max_r, alpha=0.2, color='gray', label='Min-Max Range')
+        ax.plot(times, avg_r, 'b-', linewidth=2, label='Average Sonic Radius')
+        
+        # Upstream/downstream curves (for BHL scenarios)
+        if upstream_r and len(upstream_r) > 0:
+            ax.plot(upstream_times, upstream_r, 'c--', linewidth=2, alpha=0.8,
+                   label='Upstream (θ~0, +z)', marker='o', markersize=3)
+        if downstream_r and len(downstream_r) > 0:
+            ax.plot(downstream_times, downstream_r, 'm--', linewidth=2, alpha=0.8,
+                   label='Downstream (θ~π, -z)', marker='s', markersize=3)
+        
+        # Theory reference - scenario-dependent
+        if "Bondi-Hoyle-Lyttleton" in scenario or "BHL" in scenario:
+            # For BHL, plot the accretion radius as reference
+            ax.axhline(R_ACC_BHL, color='orange', linestyle=':', linewidth=2,
+                      label=f'BHL accretion radius: r≈{R_ACC_BHL:.1f}')
+            # Add note about asymmetry
+            ax.text(0.02, 0.98, 'Note: BHL sonic surface is highly asymmetric\n' +
+                   'Upstream: typically no sonic point (supersonic flow)\n' +
+                   'Downstream: sonic point at bow shock',
+                   transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        else:
+            # For pure Bondi, use the standard sonic radius
+            ax.axhline(R_SONIC_THEORY_BONDI, color='orange', linestyle=':', linewidth=2,
+                      label=f'Theory (γ=5/3): r≈{R_SONIC_THEORY_BONDI:.1f}')
+        
+        ax.set_xlabel('Time (t/tg)', fontsize=12)
+        ax.set_ylabel('Sonic Radius (r_g)', fontsize=12)
+        title = 'Sonic Surface Evolution (2D)'
+        if scenario:
+            title += f' - {scenario}'
+        ax.set_title(title, fontsize=14, weight='bold')
+        ax.legend(fontsize=10, loc='best')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        filename = f"sonic_evolution_2d_{scenario.lower().replace(' ', '_')}.png"
+        plt.savefig(os.path.join(self.output_dir, filename), dpi=150)
+        plt.close()
+
+    
+    def plot_2d_sonic_surface_map(self, dump_file, scenario=""):
+        """
+        Create 2D map with sonic surface contour.
+        Shows full circle with mirrored domain.
+        """
+        self.load_data("gdump", dump_file)
+        
+        # Calculate velocity magnitude for background (sonic surface is about VELOCITY!)
+        v1p = hs.v1p.squeeze()  # Lab frame radial velocity - THIS is what works!
+        u_r = (hs.uu[1] / hs.uu[0]).squeeze()
+        u_theta = (hs.uu[2] / hs.uu[0]).squeeze()
+        v_mag = np.sqrt(u_r**2 + u_theta**2)  # Velocity magnitude
+        
+        # Also get Mach for comparison
+        P = hs.pg.squeeze()
+        rho = hs.rho.squeeze()
+        c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
+        mach = v_mag / c_s
+        
+        # Cartesian coordinates
+        r = hs.r.squeeze()
+        theta = hs.h.squeeze()
+        
+        # Mirror domain for full circle visualization
+        x_full, z_full, v_mag_full = self.mirror_domain(r, theta, v_mag)
+        _, _, mach_full = self.mirror_domain(r, theta, mach)
+        _, _, v1p_full = self.mirror_domain(r, theta, v1p)
+        
+        fig, ax = plt.subplots(figsize=(10, 9))
+        
+        # VELOCITY MAGNITUDE background (makes physical sense with sonic surface!)
+        v_mag_pos = v_mag_full.copy()
+        v_mag_pos[~np.isfinite(v_mag_pos)] = np.nan
+        
+        # Use percentiles for better color distribution
+        vmin_v = np.nanpercentile(v_mag_pos, 5)
+        vmax_v = np.nanpercentile(v_mag_pos, 95)
+        
+        im = ax.pcolormesh(x_full, z_full, v_mag_pos,
+                          vmin=vmin_v, vmax=vmax_v,
+                          cmap='plasma', alpha=0.8, shading='auto')
+        cbar = plt.colorbar(im, ax=ax, label='Velocity Magnitude (c)', pad=0.02)
+        
+        # Sonic surface (v1p = 0) - Using the PROVEN method from analyze_2d_sonic_surface!
+        # DIAGNOSTIC: Check v1p and velocity ranges
+        v1p_min, v1p_max = np.nanmin(v1p_full), np.nanmax(v1p_full)
+        v1p_near_0 = np.sum((v1p_full > -0.1) & (v1p_full < 0.1))
+        v_mag_min, v_mag_max = np.nanmin(v_mag_full), np.nanmax(v_mag_full)
+        mach_min, mach_max = np.nanmin(mach_full), np.nanmax(mach_full)
+        mach_near_1 = np.sum((mach_full > 0.9) & (mach_full < 1.1))
+        
+        print(f"\n=== SONIC SURFACE PLOT DIAGNOSTICS ===")
+        print(f"Background: Velocity magnitude")
+        print(f"  Velocity range: [{v_mag_min:.3f}, {v_mag_max:.3f}] c")
+        print(f"  Mach range: [{mach_min:.3f}, {mach_max:.3f}]")
+        print(f"  Points with 0.9 < Mach < 1.1: {mach_near_1}")
+        print(f"Sonic surface detection (v1p=0):")
+        print(f"  v1p range: [{v1p_min:.3f}, {v1p_max:.3f}]")
+        print(f"  Points with -0.1 < v1p < 0.1: {v1p_near_0}")
+        print(f"  v1p=0 exists: {np.any((v1p_full > -0.01) & (v1p_full < 0.01))}")
+        
+        # Layer 1: Thick black base for contrast - USE v1p=0
+        try:
+            cs_base = ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                               colors='black', linewidths=10, alpha=0.6, zorder=3)
+            print("✓ Black base contour (v1p=0) plotted successfully")
         except Exception as e:
-            print(f"Error analyzing {dump_file}: {e}")
+            print(f"✗ Black contour failed: {e}")
+        
+        # Layer 2: Medium red contour - USE v1p=0
+        try:
+            cs_red = ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                              colors='red', linewidths=6, alpha=1.0, zorder=4)
+            print("✓ Red contour (v1p=0) plotted successfully")
+        except Exception as e:
+            print(f"✗ Red contour failed: {e}")
+        
+        # Layer 3: Thin white highlight - USE v1p=0
+        try:
+            cs_white = ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                                colors='white', linewidths=2, alpha=0.8, zorder=5)
+            # Add label
+            ax.clabel(cs_white, inline=True, fontsize=11, fmt='SONIC', 
+                     manual=[(0, np.max(z_full)*0.6)])
+            print("✓ White contour (v1p=0) plotted successfully")
+        except Exception as e:
+            print(f"✗ White contour failed: {e}")
+        print("=================================\n")
+        
+        # Directional indicator - ONLY for asymmetric scenarios
+        if "Bondi-Hoyle-Lyttleton" in scenario or "BHL" in scenario.upper():
+            # Add simple arrow showing wind direction
+            arrow_props = dict(arrowstyle='->', lw=3, color='cyan', alpha=0.8)
+            ax.annotate('', xy=(0, np.max(z_full)*0.75), xytext=(0, np.max(z_full)*0.95),
+                       arrowprops=arrow_props)
+            ax.text(0, np.max(z_full)*0.97, 'Wind', ha='center', fontsize=10,
+                   weight='bold', color='cyan',
+                   bbox=dict(boxstyle='round', fc='black', alpha=0.7, pad=0.3))
+        
+        # Add subsonic/supersonic region labels
+        ax.text(0.02, 0.98, 'Subsonic\n(v < c_s)', 
+               transform=ax.transAxes, fontsize=9, va='top',
+               bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+        ax.text(0.98, 0.02, 'Supersonic\n(v > c_s)', 
+               transform=ax.transAxes, fontsize=9, va='bottom', ha='right',
+               bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+        
+        # Horizon
+        r_h = 2.0
+        horizon = plt.Circle((0, 0), r_h, color='black', fill=True)
+        ax.add_patch(horizon)
+        
+        ax.set_xlabel('x (r_g)', fontsize=12)
+        ax.set_ylabel('z (r_g)', fontsize=12)
+        title = f'Sonic Surface Map (t={hs.t:.1f})'
+        if scenario:
+            title += f' - {scenario}'
+        ax.set_title(title, fontsize=13, weight='bold')
+        ax.set_aspect('equal')
+        
+        plt.tight_layout()
+        filename = f"sonic_map_2d_{scenario.lower().replace(' ', '_')}.png"
+        plt.savefig(os.path.join(self.output_dir, filename), dpi=150)
+        plt.close()
+    # =========================================================================
+    # VELOCITY FIELD ANALYSIS
+    # =========================================================================
     
-    return results
+    def verify_velocity_transformation(self, dump_file):
+        """
+        Verify velocity transformation from spherical to Cartesian.
+        Tests the init.c implementation.
+        """
+        self.load_data("gdump", dump_file)
+        
+        u_r = hs.uu[1] / hs.uu[0]
+        u_theta = hs.uu[2] / hs.uu[0]
+        theta = hs.h.squeeze()
+        
+        # Transform to Cartesian
+        v_x = u_r * np.sin(theta) + u_theta * np.cos(theta)
+        v_z = u_r * np.cos(theta) - u_theta * np.sin(theta)
+        
+        stats = {
+            'v_z_mean': float(np.mean(v_z)),
+            'v_z_std': float(np.std(v_z)),
+            'v_x_mean': float(np.mean(v_x)),
+            'v_x_std': float(np.std(v_x))
+        }
+        
+        print(f"\nVelocity Statistics:")
+        print(f"  v_z: mean={stats['v_z_mean']:.4f}, std={stats['v_z_std']:.4f}")
+        print(f"  v_x: mean={stats['v_x_mean']:.4f}, std={stats['v_x_std']:.4f}")
+        
+        return stats
+    
+    def plot_velocity_field(self, dump_file, scenario=""):
+        """
+        Plot velocity field with LARGE VISIBLE arrows (magnetized_analysis_v3 pattern).
+        Shows full circle with mirrored domain.
+        """
+        self.load_data("gdump", dump_file)
+        
+        # Transform to Cartesian
+        u_r = (hs.uu[1] / hs.uu[0]).squeeze()
+        u_theta = (hs.uu[2] / hs.uu[0]).squeeze()
+        r = hs.r.squeeze()
+        theta = hs.h.squeeze()
+        rho = hs.rho.squeeze()
+        
+        v_x = u_r * np.sin(theta) + u_theta * np.cos(theta)
+        v_z = u_r * np.cos(theta) - u_theta * np.sin(theta)
+        
+        # Convert to Cartesian coordinates
+        x = r * np.sin(theta)
+        z = r * np.cos(theta)
+        
+        # Mirror domain - note v_x changes sign, v_z doesn't
+        x_full = np.concatenate([-x[:, ::-1], x], axis=1)
+        z_full = np.concatenate([z[:, ::-1], z], axis=1)
+        v_x_full = np.concatenate([-v_x[:, ::-1], v_x], axis=1)  
+        v_z_full = np.concatenate([v_z[:, ::-1], v_z], axis=1)
+        u_r_full = np.concatenate([u_r[:, ::-1], u_r], axis=1)  # For color-coding
+        
+        # Mirror density for background
+        rho_full = np.concatenate([rho[:, ::-1], rho], axis=1)
+        rho_full[rho_full <= 0] = np.nan
+        
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Add density background (lighter)
+        im = ax.pcolormesh(x_full, z_full, rho_full,
+                          norm=LogNorm(vmin=np.nanpercentile(rho_full, 5),
+                                      vmax=np.nanpercentile(rho_full, 95)),
+                          cmap='gray', shading='auto', alpha=0.3)
+        plt.colorbar(im, ax=ax, label='Density (log)', shrink=0.8)
+        
+        # CRITICAL FIX: Use magnetized_analysis_v3.py arrow parameters!
+        skip = 6  # More arrows
+        
+        # Flatten for color-coding
+        x_flat = x_full[::skip, ::skip].flatten()
+        z_flat = z_full[::skip, ::skip].flatten()
+        vx_flat = v_x_full[::skip, ::skip].flatten()
+        vz_flat = v_z_full[::skip, ::skip].flatten()
+        ur_flat = u_r_full[::skip, ::skip].flatten()
+        
+        # Color-code by radial direction
+        inward_mask = ur_flat < 0  # Infall
+        outward_mask = ur_flat >= 0  # Outflow
+        
+        # INWARD arrows (BLACK) - MUCH MORE VISIBLE!
+        if np.any(inward_mask):
+            ax.quiver(x_flat[inward_mask], z_flat[inward_mask],
+                     vx_flat[inward_mask], vz_flat[inward_mask],
+                     scale=0.3, scale_units='xy',  # KEY CHANGE!
+                     width=0.008,  # Thicker (was 0.003)
+                     headwidth=6, headlength=7,  # Bigger heads
+                     color='black', alpha=0.95, zorder=5)
+        
+        # OUTWARD arrows (GRAY)
+        if np.any(outward_mask):
+            ax.quiver(x_flat[outward_mask], z_flat[outward_mask],
+                     vx_flat[outward_mask], vz_flat[outward_mask],
+                     scale=0.3, scale_units='xy',
+                     width=0.008,
+                     headwidth=6, headlength=7,
+                     color='lightgray', edgecolors='gray', linewidths=0.5,
+                     alpha=0.95, zorder=5)
+        
+        # Legend
+        legend_elements = [
+            Line2D([0], [0], marker='>', color='w', markerfacecolor='black',
+                   markersize=12, label='Inflow (ur<0)'),
+            Line2D([0], [0], marker='>', color='w', markerfacecolor='lightgray',
+                   markeredgecolor='gray', markersize=12, label='Outflow (ur≥0)')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=11, framealpha=0.9)
+        ax.set_xlabel('x (r_g)', fontsize=12)
+        ax.set_ylabel('z (r_g)', fontsize=12)
+        title = f'Velocity Field (t={hs.t:.1f})'
+        if scenario:
+            title += f' - {scenario}'
+        ax.set_title(title, fontsize=13, weight='bold')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        filename = f"velocity_field_{scenario.lower().replace(' ', '_')}.png"
+        plt.savefig(os.path.join(self.output_dir, filename), dpi=150)
+        plt.close()
+    
+    # =========================================================================
+    # ANIMATIONS WITH PROPER COLOR SCALING
+    # =========================================================================
+    
+    def animate_density(self, dump_files, scenario="", fps=12):
+        """
+        Create density animation with percentile-based color scaling.
+        """
+        print(f"Creating density animation ({len(dump_files)} frames)...")
+        
+        fig, ax = plt.subplots(figsize=(9, 8))
+        
+        # Compute global color limits (percentile-based)
+        print("  Computing global color limits...")
+        all_rho = []
+        for dump_file in dump_files[::5]:  # Sample
+            self.load_data("gdump", dump_file)
+            rho_pos = hs.rho.squeeze()[hs.rho.squeeze() > 0]
+            all_rho.extend(rho_pos.flatten())
+        
+        # Use narrower percentiles (1-99 instead of 5-95) for better evolution visibility
+        vmin = np.percentile(all_rho, 5)
+        vmax = np.percentile(all_rho, 95)
+        print(f"  Color range: [{vmin:.2e}, {vmax:.2e}]")
+        
+        # Also print time range to verify evolution
+        self.load_data("gdump", dump_files[0])
+        t_start = hs.t
+        self.load_data("gdump", dump_files[-1])
+        t_end = hs.t
+        print(f"  Time range: {t_start:.2f} to {t_end:.2f}")
+        
+        # Setup coordinates
+        self.load_data("gdump", dump_files[0])
+        r = hs.r.squeeze()
+        theta = hs.h.squeeze()
+        x = r * np.sin(theta)
+        z = r * np.cos(theta)
+        
+        def update(frame):
+            ax.clear()
+            self.load_data("gdump", dump_files[frame])
+            rho = hs.rho.squeeze()
+            rho[rho <= 0] = np.nan
+            
+            # Mirror domain for full circle
+            r_current = hs.r.squeeze()
+            theta_current = hs.h.squeeze()
+            x_full, z_full, rho_full = self.mirror_domain(r_current, theta_current, rho)
+            
+            ax.pcolormesh(x_full, z_full, rho_full, norm=LogNorm(vmin=vmin, vmax=vmax),
+                        cmap='viridis', shading='auto')
+            ax.set_xlabel('x (r_g)', fontsize=12)
+            ax.set_ylabel('z (r_g)', fontsize=12)
+            ax.set_title(f'Density Evolution (t={hs.t:.1f})', fontsize=14)
+            ax.set_aspect('equal')
+            
+            return []
+        
+        # Initial frame for colorbar
+        self.load_data("gdump", dump_files[0])
+        rho = hs.rho.squeeze()
+        rho[rho <= 0] = np.nan
+        im = ax.pcolormesh(x, z, rho, norm=LogNorm(vmin=vmin, vmax=vmax),
+                          cmap='viridis', shading='auto')
+        cbar = fig.colorbar(im, ax=ax, label='Density (log)')
+        
+        ani = animation.FuncAnimation(fig, update, frames=len(dump_files),
+                                     interval=100, blit=False)
+        
+        filename = f"density_anim_{scenario.lower().replace(' ', '_')}.mp4"
+        output_path = os.path.join(self.output_dir, filename)
+        
+        # TRY-EXCEPT BLOCK for animation saving (Issue #2 fix)
+        try:
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"\n✓ Saved: {filename}")
+        except Exception as e:
+            print(f"\n✗ Error saving animation: {e}")
+            print("  Make sure ffmpeg is installed: sudo apt-get install ffmpeg")
+        finally:
+            plt.close(fig)
+    
+    def animate_sonic_surface(self, dump_files, scenario="", fps=10):
+        """
+        Animate sonic surface evolution with Mach number coloring.
+        Shows full circle with mirrored domain.
+        """
+        print(f"Creating sonic surface animation ({len(dump_files)} frames)...")
+        
+        fig, ax = plt.subplots(figsize=(10, 9))
+        
+        # Sample files for reasonable animation length (inline, no helper function)
+        if len(dump_files) > 100:
+            # Sample every Nth file to get ~100 frames
+            sample_every = max(1, len(dump_files) // 100)
+            sampled_files = dump_files[::sample_every]
+        else:
+            sampled_files = dump_files
+        
+        print(f"  Using {len(sampled_files)} frames")
+        
+        # Compute global Mach number range
+        print("  Computing global Mach range...")
+        all_mach = []
+        for dump_file in sampled_files[::5]:  # Sample
+            self.load_data("gdump", dump_file)
+            rho = hs.rho.squeeze()
+            v_r = (hs.uu[1] / hs.uu[0]).squeeze()
+            P = hs.pg.squeeze()
+            c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
+            mach = (np.abs(v_r) / c_s).squeeze()
+            
+            mach_valid = mach[np.isfinite(mach)]
+            all_mach.extend(mach_valid.flatten())
+        
+        vmin_mach = np.percentile(all_mach, 5)
+        vmax_mach = np.percentile(all_mach, 95)
+        print(f"  Mach range: [{vmin_mach:.2f}, {vmax_mach:.2f}]")
+        
+        def update(frame):
+            ax.clear()
+            self.load_data("gdump", sampled_files[frame])
+            
+            # Compute fields - USE v1p for contours!
+            rho = hs.rho.squeeze()
+            v1p = hs.v1p.squeeze()  # Lab frame velocity
+            v_r = (hs.uu[1] / hs.uu[0]).squeeze()
+            P = hs.pg.squeeze()
+            c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
+            mach = (np.abs(v_r) / c_s).squeeze()
+            
+            r = hs.r.squeeze()
+            theta = hs.h.squeeze()
+            
+            # Mirror domain for full circle
+            x_full, z_full, mach_full = self.mirror_domain(r, theta, mach)
+            _, _, v1p_full = self.mirror_domain(r, theta, v1p)  # For contours!
+            
+            # Plot Mach number with colormap
+            mach_full[~np.isfinite(mach_full)] = np.nan
+            im = ax.pcolormesh(x_full, z_full, mach_full,
+                            vmin=vmin_mach, vmax=vmax_mach,
+                            cmap='RdYlBu_r', shading='auto', alpha=0.8)
+            
+            # Overlay sonic surface contour (v1p = 0) - Same method as static plots!
+            try:
+                # Base layer
+                ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                        colors='black', linewidths=8, alpha=0.7, zorder=3)
+                # Main layer
+                ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                        colors='red', linewidths=5, alpha=1.0, zorder=4)
+                # Highlight
+                ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                        colors='white', linewidths=2, alpha=0.9, zorder=5)
+            except:
+                # Silently fail if v1p=0 doesn't exist at this time
+                pass
+            
+            # Add subsonic/supersonic labels
+            ax.text(0.02, 0.98, 'Subsonic\n(M < 1)',
+                transform=ax.transAxes, fontsize=10, va='top',
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+            ax.text(0.98, 0.98, 'Supersonic\n(M > 1)',
+                transform=ax.transAxes, fontsize=10, va='top', ha='right',
+                bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+            
+            ax.set_xlabel('x (r_g)', fontsize=12)
+            ax.set_ylabel('z (r_g)', fontsize=12)
+            ax.set_title(f'Sonic Surface Evolution (t={hs.t:.1f})', fontsize=14)
+            ax.set_aspect('equal')
+            
+            # Add horizon circle
+            horizon = plt.Circle((0, 0), 1.0, color='black', fill=False,
+                            linestyle='--', linewidth=1.5, alpha=0.5)
+            ax.add_patch(horizon)
+            
+            return [im]
+        
+        # Create initial frame for colorbar
+        self.load_data("gdump", sampled_files[0])
+        rho = hs.rho.squeeze()
+        v_r = (hs.uu[1] / hs.uu[0]).squeeze()
+        P = hs.pg.squeeze()
+        c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
+        mach = (np.abs(v_r) / c_s).squeeze()
+        r = hs.r.squeeze()
+        theta = hs.h.squeeze()
+        
+        x_full, z_full, mach_full = self.mirror_domain(r, theta, mach)
+        mach_full[~np.isfinite(mach_full)] = np.nan
+        
+        im = ax.pcolormesh(x_full, z_full, mach_full,
+                        vmin=vmin_mach, vmax=vmax_mach,
+                        cmap='RdYlBu_r', shading='auto', alpha=0.8)
+        cbar = fig.colorbar(im, ax=ax, label='Mach Number', pad=0.02)
+        cbar.ax.axhline(y=1.0, color='black', linewidth=2, linestyle='-')
+        cbar.ax.text(0.5, 1.0, 'Sonic', transform=cbar.ax.transAxes,
+                    ha='left', va='center', fontsize=9, fontweight='bold')
+        
+        ani = animation.FuncAnimation(fig, update, frames=len(sampled_files),
+                                    interval=100, blit=False)
+        
+        filename = f"sonic_anim_{scenario.lower().replace(' ', '_')}.mp4"
+        output_path = os.path.join(self.output_dir, filename)
+        
+        # Save with error handling
+        try:
+            ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
+            print(f"\n✓ Saved: {filename}")
+            file_size = os.path.getsize(output_path) / (1024*1024)
+            print(f"  Size: {file_size:.2f} MB, Duration: {len(sampled_files)/fps:.1f}s")
+        except Exception as e:
+            print(f"\n✗ Error saving animation: {e}")
+            print("  Make sure ffmpeg is installed: sudo apt-get install ffmpeg")
+        finally:
+            plt.close(fig)
 
 
-# Enhanced plotting for wind effects (from old version)
-def plot_wind_effects(sonic_results, title_suffix="", show_asymmetry=True):
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+
+def main():
     """
-    Plot sonic surface evolution with wind effects
-    """
-    valid_results = [r for r in sonic_results if r['avg_sonic_r'] is not None]
+    Main analysis function with clean argument handling.
     
-    if not valid_results:
-        print("No valid sonic surface data!")
+    IMPORTANT: This script expects a 'dumps' symlink in the current directory
+    pointing to your data. The --scenario flag is ONLY for plot labeling.
+    """
+    
+    parser = argparse.ArgumentParser(
+        description='Bondi Accretion Analysis',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+SETUP INSTRUCTIONS:
+  Before running, create a symlink pointing to your data:
+    cd ~/harmpi
+    ln -sf dumps_bondi_2d_pure_128 dumps
+    
+  The 'dumps' symlink must exist and point to a folder containing:
+    - gdump (grid file)
+    - dump000, dump001, ... (dump files)
+
+EXAMPLES:
+  # 1D Pure Bondi analysis
+  ln -sf dumps_bondi_1d_pure dumps
+  python bondi_analysis.py --dim 1
+  
+  # If you DON'T want animations
+  ln -sf dumps_bondi_2d_bhl_128 dumps
+  python bondi_analysis.py --scenario bhl --no-animations
+  
+  # 2D gradient with velocity check
+  ln -sf dumps_bondi_2d_gradient_128 dumps
+  python bondi_analysis.py --scenario gradient --velocity-check
+
+NOTE: The --scenario flag is ONLY for labeling plots. The actual data 
+      comes from whatever the 'dumps' symlink points to!
+        """
+    )
+    
+    # Core options
+    parser.add_argument('--scenario', type=str, default='pure',
+                       choices=['pure', 'bhl', 'gradient', 'angular', 'random'],
+                       help='Scenario name (for plot labels only)')
+    parser.add_argument('--dim', type=int, default=2, choices=[1, 2],
+                       help='Dimension (1D or 2D)')
+    parser.add_argument('--output', type=str, default='./bondi_plots',
+                       help='Output directory')
+    
+    # Analysis flags
+    parser.add_argument('--no-animations', action='store_true',
+                       help='Skip animations (they run by default)')
+    parser.add_argument('--velocity-check', action='store_true',
+                       help='Verify velocity transformation (Session 2)')
+    parser.add_argument('--sonic-map', action='store_true',
+                       help='Generate 2D sonic surface map')
+    parser.add_argument('--fps', type=int, default=12,
+                       help='Animation FPS')
+    
+    args = parser.parse_args()
+    
+    # Scenario names for plot labels
+    scenario_names = {
+        'pure': 'Pure Bondi',
+        'bhl': 'Bondi-Hoyle-Lyttleton',
+        'gradient': 'Density Gradient',
+        'angular': 'Angular Momentum',
+        'random': 'Random Velocity'
+    }
+    scenario_name = scenario_names[args.scenario]
+    
+    # Check working directory
+    if not os.path.exists("dumps"):
+        print("ERROR: 'dumps' symlink not found!")
+        print("\nPlease create a symlink to your data folder:")
+        print("  cd ~/harmpi")
+        print("  ln -sf dumps_bondi_2d_pure_128 dumps")
+        print("\nThen run this script again.")
         return
     
-    times = [r['time'] for r in valid_results]
-    avg_radii = [r['avg_sonic_r'] for r in valid_results]
+    if not os.path.islink("dumps"):
+        print("WARNING: 'dumps' exists but is not a symlink.")
+        print("This script expects 'dumps' to be a symlink pointing to your data.")
     
-    if show_asymmetry:
-        asymmetries = [r['asymmetry'] for r in valid_results]
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    else:
-        fig, ax1 = plt.subplots(1, 1, figsize=(12, 6))
+    # Check for gdump
+    if not os.path.exists("dumps/gdump"):
+        print("ERROR: dumps/gdump not found!")
+        print("Make sure your dumps folder contains the gdump file.")
+        return
     
-    # Plot 1: Sonic radius evolution
-    ax1.plot(times, avg_radii, 'g-', linewidth=2, label='Average Sonic Radius')
+    # Get dump files using glob - returns BARE BASENAMES
+    dump_files = sorted(glob.glob("dumps/dump[0-9][0-9][0-9]"))
+    dump_files = [os.path.basename(f) for f in dump_files]  # Just "dump000", not "dumps/dump000"
     
-    # Add upstream/downstream if available
-    upstream_times, downstream_times = [], []
-    upstream_radii, downstream_radii = [], []
+    if not dump_files:
+        print("ERROR: No dump files found in dumps/")
+        return
     
-    for r in valid_results:
-        if r['upstream_sonic_r'] is not None:
-            upstream_times.append(r['time'])
-            upstream_radii.append(r['upstream_sonic_r'])
-        if r['downstream_sonic_r'] is not None:
-            downstream_times.append(r['time'])
-            downstream_radii.append(r['downstream_sonic_r'])
+    # Initialize analyzer
+    analyzer = BondiAnalysis(output_dir=args.output)
     
-    if upstream_radii:
-        ax1.plot(upstream_times, upstream_radii, 'b--', alpha=0.7, label='Upstream Sonic Radius')
-    if downstream_radii:
-        ax1.plot(downstream_times, downstream_radii, 'r--', alpha=0.7, label='Downstream Sonic Radius')
+    print(f"\n{'='*70}")
+    print(f"BONDI ANALYSIS: {scenario_name.upper()} ({args.dim}D)")
+    print(f"{'='*70}")
+    print(f"Data source: {os.readlink('dumps') if os.path.islink('dumps') else 'dumps/'}")
+    print(f"Dumps found: {len(dump_files)} files (dump000 to dump{len(dump_files)-1:03d})")
+    print(f"Output: {args.output}/")
+    print()
     
-    ax1.set_xlabel('Time')
-    ax1.set_ylabel('Sonic Radius')
-    ax1.set_title(f'Sonic Surface Evolution {title_suffix}')
-    ax1.legend()
-    ax1.grid(True)
-    
-    # Plot 2: Flow asymmetry (if requested)
-    if show_asymmetry:
-        ax2.plot(times, asymmetries, 'purple', linewidth=2)
-        ax2.set_xlabel('Time')
-        ax2.set_ylabel('Flow Asymmetry (R_max - R_min)/R_avg')
-        ax2.set_title(f'Sonic Surface Asymmetry {title_suffix}')
-        ax2.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-
-
-# Enhanced scenario detection (from old version)
-def detect_flow_regime(dump_files, cache={}, sample_size=5, force_regime=None):
-    """
-    Detect what type of Bondi modification we're dealing with
-    IMPROVED: Multi-criteria detection to avoid misclassification
-    
-    Args:
-        force_regime: Optional manual override ("random_velocity", "density_gradient", "wind", "angular_momentum")
-    """
-    # Manual override if specified
-    if force_regime:
-        regime_map = {
-            "random_velocity": "Bondi with Random Velocity",
-            "density_gradient": "Bondi with Density Gradient", 
-            "wind": "Bondi-Hoyle-Lyttleton (Wind)",
-            "angular_momentum": "Bondi with Angular Momentum"
-        }
-        if force_regime.lower() in regime_map:
-            forced_regime = regime_map[force_regime.lower()]
-            print(f"MANUAL OVERRIDE: Forcing regime to {forced_regime}")
-            return forced_regime, {'manual_override': True}
-    
-    total_vy = 0  # Wind velocity
-    total_angular = 0  # Angular momentum
-    velocity_variance = 0  # Random velocity
-    density_gradient = 0  # Density variation
-    velocity_spatial_variance = 0  # Spatial variation in velocity field
-    radial_density_profile_strength = 0  # Strength of radial density profile
-    count = 0
-    
-    sample_files = dump_files[:sample_size]
-    
-    for dump_file in sample_files:
-        try:
-            load_data("gdump", dump_file, cache=cache)
-            
-            # Check for uniform wind
-            if hasattr(hs, 'vu') and len(hs.vu) > 2:
-                vy = hs.vu[2].squeeze()
-                total_vy += np.abs(vy).mean()
-            
-            # Check for angular momentum - FIXED
-            if hasattr(hs, 'vu') and len(hs.vu) > 3:
-                vphi = hs.vu[3].squeeze()
-                total_angular += np.abs(vphi).mean()
-            elif hasattr(hs, 'up'):  # Alternative way to access phi velocity
-                up = hs.up.squeeze()
-                total_angular += np.abs(up).mean()
-            
-            # Check velocity field randomness (temporal)
-            vr = hs.vu[1].squeeze() if hasattr(hs, 'vu') else hs.v1p.squeeze()
-            velocity_variance += np.var(vr)
-            
-            # NEW: Check spatial velocity variation (key for random velocity)
-            if hasattr(hs, 'vu') and len(hs.vu) > 2:
-                vx, vy = hs.vu[1].squeeze(), hs.vu[2].squeeze()
-            else:
-                vx, vy = hs.v1p.squeeze(), hs.v2p.squeeze()
-            
-            # Measure spatial variation in velocity field
-            vx_spatial_var = np.var(vx)
-            vy_spatial_var = np.var(vy)
-            velocity_spatial_variance += (vx_spatial_var + vy_spatial_var)
-            
-            # Check density gradient - but also check if it's primarily radial
-            rho = hs.rho.squeeze()
-            r = hs.r.squeeze()
-            
-            # Standard density gradient check
-            rho_profile = rho.mean(axis=1) if rho.ndim > 1 else rho
-            r_profile = r[:, 0] if r.ndim > 1 else r
-            if len(r_profile) > 10:
-                density_gradient += np.abs(np.gradient(np.log(rho_profile), np.log(r_profile))).mean()
-            
-            # NEW: Check if density profile is primarily radial (true density gradient)
-            # vs random/turbulent (random velocity case)
-            if rho.ndim > 1:
-                # Compare radial profile smoothness vs angular variation
-                rho_angular_var = np.var(rho, axis=1).mean()  # Variation in theta direction
-                rho_radial_var = np.var(rho_profile)  # Variation in radial direction
-                if rho_radial_var > 0:
-                    radial_density_profile_strength += rho_radial_var / (rho_radial_var + rho_angular_var)
-                
-            count += 1
-        except:
-            continue
-    
-    if count == 0:
-        return "Unknown", {}
-    
-    # Average the metrics
-    avg_vy = total_vy / count
-    avg_angular = total_angular / count
-    avg_variance = velocity_variance / count
-    avg_gradient = density_gradient / count
-    avg_spatial_var = velocity_spatial_variance / count
-    avg_radial_profile = radial_density_profile_strength / count
-    
-    # IMPROVED: Multi-criteria classification with priority logic
-    regime_type = "Pure Bondi"
-    characteristics = {}
-    
-    print(f"Detection values:")
-    print(f"  gradient={avg_gradient:.3f}, radial_profile={avg_radial_profile:.3f}")
-    print(f"  wind={avg_vy:.6f}, angular={avg_angular:.6f}")
-    print(f"  velocity_variance={avg_variance:.3f}, spatial_variance={avg_spatial_var:.3f}")
-    
-    # Random velocity: Adjusted thresholds based on actual simulation data
-    # Check for combination of wind + measurable spatial variation
-    if avg_spatial_var > 0.005 and avg_variance > 0.0005 and avg_vy > 0.01:
-        regime_type = "Bondi with Random Velocity"
-        characteristics['velocity_variance'] = avg_variance
-        characteristics['spatial_variance'] = avg_spatial_var
-        characteristics['wind_component'] = avg_vy  # Also record the baseline wind
-    # Density gradient: High gradient + strong radial profile + low spatial velocity variation
-    elif avg_gradient > 1.0 and avg_radial_profile > 0.7 and avg_spatial_var < 0.02:
-        regime_type = "Bondi with Density Gradient"
-        characteristics['density_gradient_strength'] = avg_gradient
-        characteristics['radial_profile_strength'] = avg_radial_profile
-        characteristics['wind_component'] = avg_vy  # Also record wind component
-    # BHL wind: High uniform wind WITHOUT significant turbulence
-    elif avg_vy > 0.01 and avg_spatial_var < 0.02:
-        regime_type = "Bondi-Hoyle-Lyttleton (Wind)"
-        characteristics['wind_velocity'] = avg_vy
-    # Angular momentum: Significant angular velocity
-    elif avg_angular > 0.01:
-        regime_type = "Bondi with Angular Momentum"
-        characteristics['angular_velocity'] = avg_angular
-    # Fallback: If wind detected but criteria unclear
-    elif avg_vy > 0.01:
-        regime_type = "Mixed Wind/Turbulent Flow"
-        characteristics['wind_velocity'] = avg_vy
-        characteristics['spatial_variance'] = avg_spatial_var
-    
-    print(f"Flow regime detected: {regime_type}")
-    for key, value in characteristics.items():
-        print(f"  {key}: {value:.4f}")
-    
-    return regime_type, characteristics
-
-
-# Fixed main execution for 2D analysis (from old version but with time fix)
-def main_2d_analysis_corrected(dump_files, args):
-    """
-    Corrected main analysis function for 2D Bondi problem
-    """
-    cache = {}
-    
-    print("Step 1: Analyzing sonic surfaces with corrected time collection...")
-    sonic_analysis_2d = analyze_2d_sonic_surface(dump_files, cache=cache, debug=True)
-    
-    # Verify we have different times
-    times = [result['time'] for result in sonic_analysis_2d if result['time'] is not None]
-    print(f"\nTime range: {min(times):.3f} to {max(times):.3f}")
-    print(f"Number of unique times: {len(set(times))}")
-    
-    # Plot sonic evolution with the corrected data
-    print("Step 2: Plotting sonic surface evolution...")
-    plot_2d_sonic_evolution(sonic_analysis_2d)
-    
-    # Fixed animations - USE ALL DUMP FILES, no subsampling
-    animate_density_distribution("gdump", dump_files,
-                                output_file=os.path.join(args.output, "bondi_density.mp4"), fps=10)
-    animate_density_contours("gdump", dump_files, levels=30,
-                            output_file=os.path.join(args.output, "bondi_density_contours.mp4"), fps=10)
-
-
-# Modified main execution for enhanced 2D analysis (from old version but with time fix)
-def main_2d_analysis_enhanced(dump_files, args):
-    """
-    Enhanced main analysis function that detects flow regime and adapts accordingly
-    """
-    cache = {}
-    
-    print("=== ENHANCED 2D BONDI ANALYSIS ===")
-    
-    # Debug: Check what data we actually have
-    print(f"Total dump files found: {len(dump_files)}")
-    print(f"First 5 files: {dump_files[:5]}")
-    print(f"Last 5 files: {dump_files[-5:]}")
-    
-    # Check time range
-    load_data("gdump", dump_files[0], cache=cache)
-    t_start = hs.t
-    load_data("gdump", dump_files[-1], cache=cache)  
-    t_end = hs.t
-    print(f"Time range: {t_start:.1f} to {t_end:.1f}")
-    
-    # Step 1: Enhanced regime detection with manual override option
-    regime_type, characteristics = detect_flow_regime(dump_files, cache=cache, force_regime="random_velocity")
-    
-    # Create safe filename from regime type
-    safe_regime_name = regime_type.lower().replace(' ', '_').replace('(', '').replace(')', '').replace('-', '_')
-    
-    print(f"Analysis type: {regime_type}")
-    
-    # Step 2: Run appropriate sonic analysis based on detected regime
-    if "Wind" in regime_type or "Angular Momentum" in regime_type:
-        print("Running enhanced sonic analysis with asymmetry tracking...")
-        sonic_results = analyze_sonic_surface_with_wind(dump_files, cache=cache, debug=True)
-        plot_wind_effects(sonic_results, title_suffix=f"({regime_type})", show_asymmetry=True)
-        create_velocity_animation = True  # These regimes benefit from velocity visualization
-    elif "Random Velocity" in regime_type:
-        print("Running enhanced sonic analysis for turbulent flow...")
-        sonic_results = analyze_sonic_surface_with_wind(dump_files, cache=cache, debug=True)
-        plot_wind_effects(sonic_results, title_suffix=f"({regime_type})", show_asymmetry=True)
-        create_velocity_animation = True  # Show velocity structure
-    elif "Density Gradient" in regime_type:
-        print("Running standard sonic analysis with density gradient...")
-        sonic_results = analyze_2d_sonic_surface(dump_files, cache=cache, debug=True)
-        plot_2d_sonic_evolution(sonic_results, title_suffix=f"({regime_type})")
-        create_velocity_animation = True  # Enable velocity animation for density gradient
-    else:
-        print("Running standard 2D sonic analysis...")
-        sonic_results = analyze_2d_sonic_surface(dump_files, cache=cache, debug=True)
-        plot_2d_sonic_evolution(sonic_results, title_suffix=f"({regime_type})")
-        create_velocity_animation = False  # Pure Bondi case
-    
-    # Step 3: Create appropriate animations - USE ALL DUMP FILES
-    print("Creating animations...")
-    
-    print(f"Creating animations with {len(dump_files)} frames covering t≈{t_start:.1f} to t≈{t_end:.1f}")
-    
-    # Always create density animation
-    animate_density_distribution("gdump", dump_files,
-                                output_file=os.path.join(args.output, f"bondi_density_{safe_regime_name}.mp4"), 
-                                fps=12)
-    
-    # Create density+velocity animation for regimes with interesting velocity fields
-    if create_velocity_animation:
-        animate_density_with_velocity("gdump", dump_files,
-                                     output_file=os.path.join(args.output, f"bondi_density_velocity_{safe_regime_name}.mp4"),
-                                     fps=12, skip_factor=3)
-        print(f"Created velocity field animation for {regime_type}")
-    
-    # Create contour animation
-    animate_density_contours("gdump", dump_files,
-                            levels=25,
-                            output_file=os.path.join(args.output, f"bondi_contours_{safe_regime_name}.mp4"), 
-                            fps=10)
-    
-    # Print summary of what was detected and analyzed
-    print(f"\n=== {regime_type.upper()} ANALYSIS COMPLETE ===")
-    if characteristics:
-        print("Detected characteristics:")
-        for key, value in characteristics.items():
-            print(f"  {key}: {value:.4f}")
-    
-    print(f"Generated animations:")
-    print(f"  - Density: bondi_density_{safe_regime_name}.mp4")
-    if create_velocity_animation:
-        print(f"  - Density+Velocity: bondi_density_velocity_{safe_regime_name}.mp4")
-    print(f"  - Contours: bondi_contours_{safe_regime_name}.mp4")
-
-
-# Updated main block
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze Bondi Accretion")
-    parser.add_argument("--dim", type=int, default=2, help="Simulation dimension (1 for 1D, 2 for 2D)")
-    parser.add_argument("--save", action="store_true", help="Save plots instead of showing them")
-    parser.add_argument("--output", type=str, default="./bondi_plots", help="Output folder for saved plots")
-    parser.add_argument("--enhanced", action="store_true", help="Use enhanced analysis with automatic wind detection")
-    args = parser.parse_args()
-
-    dump_folder = "/home/michelle/harmpi/dumps"
-    all_dump_files = sorted([f for f in os.listdir(dump_folder) if f.startswith("dump")])
-    selected_dump_files = ["dump021", "dump042", "dump069", "dump107", "dump216", "dump283", "dump311", "dump415", "dump459", "dump501"]
-
-    # Always ensure output directory exists
-    if not os.path.exists(args.output):
-        os.makedirs(args.output, exist_ok=True)
-
-    cache = {}
+    # =========================================================================
+    # ANALYSIS EXECUTION
+    # =========================================================================
 
     if args.dim == 1:
-        sonic_surface_results_1D = analyze_bondi_acc(selected_dump_files, dim=1, cache=cache)
-        r1d_list = []
-        rho1d_list = []
-        time1d = []
-        for dump_file in selected_dump_files:
-            load_data("gdump", dump_file, cache=cache)
-            r1d_list.append(hs.r.squeeze())
-            rho1d_list.append(hs.rho.squeeze())
-            time1d.append(hs.t)
-        plot_density_profiles(r1d_list, rho1d_list, time1d, sonic_surface_results_1D, dim=1)
-        plot_sonic_surface_evolution(time1d, [r for _, r in sonic_surface_results_1D])
-
+        # 1D Analysis
+        print("Running 1D sonic surface analysis...")
+        sonic_results = analyzer.analyze_1d_sonic_surface(dump_files[::5])
+        
+        print("Generating 1D plots...")
+        analyzer.plot_1d_density_profiles(dump_files[::5], sonic_results)
+        analyzer.plot_1d_sonic_evolution(sonic_results)
+        
+        print(f"\n✓ 1D Analysis complete!")
+        print(f"  - density_1d_profiles.png")
+        print(f"  - sonic_evolution_1d.png")
+    
     else:
-        if args.enhanced:
-            # Use the new enhanced analysis
-            main_2d_analysis_enhanced(all_dump_files, args)
-        else:
-            # Use the original corrected analysis
-            main_2d_analysis_corrected(all_dump_files, args)
+        # 2D Analysis
+        print("Running 2D sonic surface analysis...")
+        sonic_results = analyzer.analyze_2d_sonic_surface(dump_files)
+        
+        print("Generating 2D sonic evolution plot...")
+        analyzer.plot_2d_sonic_evolution(sonic_results, scenario_name)
+        
+        # Velocity verification
+        if args.velocity_check or args.scenario in ['bhl', 'gradient', 'random']:
+            print("\nVerifying velocity transformation...")
+            stats = analyzer.verify_velocity_transformation(dump_files[-1])
+            analyzer.plot_velocity_field(dump_files[len(dump_files)//2], scenario_name)
+        
+        # Sonic surface map
+        if args.sonic_map or True:  # Always generate
+            print("\nGenerating sonic surface map...")
+            analyzer.plot_2d_sonic_surface_map(dump_files[len(dump_files)//2], scenario_name)
+        
+        # Animations (run by default unless --no-animations specified)
+        if not args.no_animations:
+            print(f"\n{'='*70}")
+            print(f"GENERATING ANIMATIONS FOR {scenario_name.upper()}")
+            print(f"{'='*70}")
+            analyzer.animate_density(dump_files, scenario_name, fps=args.fps)
+            analyzer.animate_sonic_surface(dump_files, scenario_name, fps=args.fps)
+        
+        print(f"\n✓ 2D Analysis complete!")
+        print(f"  - sonic_evolution_2d_{args.scenario}.png")
+        print(f"  - sonic_map_2d_{args.scenario}.png")
+        if args.velocity_check or args.scenario in ['bhl', 'gradient', 'random']:
+            print(f"  - velocity_field_{args.scenario}.png")
+        if not args.no_animations:
+            print(f"  - density_anim_{args.scenario}.mp4 (if ffmpeg worked)")
+            print(f"  - sonic_anim_{args.scenario}.mp4 (if ffmpeg worked)")
+    
+    print(f"\nAll outputs saved to: {args.output}/")
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    main()

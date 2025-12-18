@@ -1,20 +1,21 @@
-# NOTE: might need to modify import path of hs if removed from root directory
 import harm_script as hs
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.image as mpimg
 import numpy as np
 import os
 import sys
 import argparse
+import glob
 from matplotlib.colors import LogNorm, SymLogNorm
 from matplotlib.patches import Ellipse, Rectangle
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
-import glob
+from scipy.special import legendre 
+
 
 class MagnetizedAnalysis:
     """Class for analyzing magnetized black hole problems"""
-    
     def __init__(self, output_dir="./magnetized_plots"):
         self.output_dir = output_dir
         self.cache = {}
@@ -511,7 +512,7 @@ class MagnetizedAnalysis:
         """
         Detect magnetic field topology by analyzing sign reversals in B_r(θ).
         
-        UPGRADED VERSION: Now distinguishes smooth vs discontinuous crossings.
+        IMPORTANT NOTE: this method cannot distinguish between split monopole and dipole!
         
         Physical Basis (Li & Wang 2021):
         --------------------------------
@@ -707,7 +708,7 @@ class MagnetizedAnalysis:
         n_ambiguous = sum(1 for t in crossing_types if t == 'ambiguous')
         
         # ============================================================
-        # CLASSIFY FIELD TYPE (CORRECTED LOGIC)
+        # CLASSIFY FIELD TYPE
         # ============================================================
         if n_crossings == 0:
             field_type = "Pure Monopole"
@@ -818,6 +819,234 @@ class MagnetizedAnalysis:
         
         return results
 
+    def analyze_field_multipoles_legendre(self, B_r_horizon=None, theta=None, max_order=10):
+        """
+        Analyze magnetic field topology using Legendre polynomial decomposition.
+        
+        This is the PROPER way to identify multipoles, as explained:
+        "The way to identify multipoles in the magnetic field is by decomposing into 
+        harmonic functions. When there is cylindrical symmetry, the harmonic functions 
+        become Legendre polynomials."
+        
+        Physical Basis:
+        --------------
+        For axisymmetric fields, the poloidal magnetic field can be expanded as:
+        
+            B_r(θ) = Σ_l a_l P_l(cos(θ))
+        
+        where P_l are Legendre polynomials and a_l are expansion coefficients.
+        
+        Key Insights:
+        -------------------------
+        - **Regular Monopole**: Only a_0 ≠ 0 (constant field)
+          → l=0 dominates, all other coefficients ≈ 0
+        
+        - **Pure Dipole**: Only a_1 ≠ 0  
+          → l=1 dominates, field ∝ cos(θ)
+        
+        - **Split Monopole**: 
+          → Even Legendre polynomials (l=0,2,4,...) contribute one way
+          → Odd Legendre polynomials (l=1,3,5,...) contribute differently
+          → This distinguishes it from dipole (which has only l=1)
+        
+        Why This Method is Superior to Zero-Crossing:
+        --------------------------------------------
+        Zero-crossing detection CANNOT distinguish split monopole from dipole 
+        because both vanish at the same points (equator). Legendre decomposition 
+        uses the FULL angular distribution, capturing the complete field structure.
+        
+        Parameters:
+        ----------
+        B_r_horizon : ndarray, optional
+            Radial field component at horizon vs θ
+        theta : ndarray, optional  
+            Angular coordinates (0 to π)
+        max_order : int
+            Maximum Legendre polynomial order to compute (default: 10)
+        
+        Returns:
+        -------
+        dict : {
+            'coefficients': ndarray,           # a_l for l=0,1,2,...,max_order
+            'normalized_coefficients': ndarray,# Normalized to l=0 (for monopole) or max coeff
+            'dominant_order': int,             # l with largest |a_l|
+            'field_type': str,                 # Classification
+            'monopole_strength': float,        # |a_0|
+            'dipole_strength': float,          # |a_1|  
+            'even_power': float,               # Σ a_l² for even l
+            'odd_power': float,                # Σ a_l² for odd l
+            'even_odd_ratio': float,           # even_power / odd_power
+            'confidence': str,
+            'B_r_reconstructed': ndarray,      # Reconstructed field from expansion
+            'theta': ndarray
+        }
+        
+        Classification Logic:
+        --------------------
+        - **Regular Monopole**: a_0 >> all other coefficients (>10x)
+        - **Pure Dipole**: a_1 >> all others, even_power << odd_power
+        - **Split Monopole**: Significant even AND odd contributions, even_power ~ odd_power
+        - **Quadrupole**: a_2 dominates
+        - **Mixed**: No clear dominant order
+        
+        Example:
+        -------
+        >>> analyzer = MagnetizedAnalysis()
+        >>> analyzer.load_data("gdump", "dump999")  
+        >>> multipole = analyzer.analyze_field_multipoles_legendre()
+        >>> print(f"Field type: {multipole['field_type']}")
+        >>> print(f"Dominant order: l={multipole['dominant_order']}")
+        >>> print(f"Even/Odd ratio: {multipole['even_odd_ratio']:.3f}")
+        """
+        
+        # Get B_r at horizon if not provided
+        if B_r_horizon is None or theta is None:
+            flux_data = self.calculate_hemisphere_flux()
+            B_r_horizon = flux_data['B_r_horizon']
+            theta = flux_data['theta']
+        
+        # Ensure 1D arrays
+        B_r_horizon = np.atleast_1d(B_r_horizon).flatten()
+        theta = np.atleast_1d(theta).flatten()
+        
+        # Convert theta to x = cos(theta) for Legendre polynomials
+        # θ ∈ [0,π] → x ∈ [-1,1]
+        x = np.cos(theta)
+        
+        # Compute Legendre coefficients by projection
+        # a_l = (2l+1)/2 * ∫ B_r(x) P_l(x) dx
+        #
+        # Numerically: use trapezoidal integration over x
+        coefficients = np.zeros(max_order + 1)
+        
+        for l in range(max_order + 1):
+            # Get Legendre polynomial P_l(x)
+            P_l = legendre(l)
+            P_l_values = P_l(x)
+            
+            # Integrate B_r(x) * P_l(x) over x ∈ [-1,1]
+            # Note: dx/dθ = -sin(θ), so we need to account for Jacobian
+            # But since we're working in x = cos(θ), we integrate directly in x
+            
+            # Sort by x for proper integration (x should be decreasing as θ increases)
+            sort_idx = np.argsort(x)
+            x_sorted = x[sort_idx]
+            B_r_sorted = B_r_horizon[sort_idx]
+            P_l_sorted = P_l_values[sort_idx]
+            
+            # Trapezoidal integration
+            integrand = B_r_sorted * P_l_sorted
+            integral = np.trapz(integrand, x_sorted)
+            
+            # Normalization factor for Legendre polynomials
+            coefficients[l] = (2*l + 1) / 2.0 * integral
+        
+        # Calculate power in even and odd orders
+        even_indices = np.arange(0, max_order + 1, 2)
+        odd_indices = np.arange(1, max_order + 1, 2)
+        
+        even_power = np.sum(coefficients[even_indices]**2)
+        odd_power = np.sum(coefficients[odd_indices]**2)
+        
+        # Avoid division by zero
+        if odd_power > 0:
+            even_odd_ratio = even_power / odd_power
+        else:
+            even_odd_ratio = np.inf if even_power > 0 else 1.0
+        
+        # Find dominant order
+        abs_coefficients = np.abs(coefficients)
+        dominant_order = np.argmax(abs_coefficients)
+        
+        # Normalize coefficients (relative to dominant or monopole)
+        if abs_coefficients[0] > 0:
+            # Normalize to monopole component if present
+            normalized_coefficients = coefficients / abs_coefficients[0]
+        elif abs_coefficients[dominant_order] > 0:
+            # Otherwise normalize to dominant component
+            normalized_coefficients = coefficients / abs_coefficients[dominant_order]
+        else:
+            normalized_coefficients = coefficients
+        
+        # ============================================================
+        # CLASSIFY FIELD TYPE USING LEGENDRE DECOMPOSITION
+        # ============================================================
+        
+        # Thresholds for classification
+        monopole_threshold = 10.0  # a_0 must be 10x larger than others
+        dominance_threshold = 5.0   # Dominant mode must be 5x larger
+        
+        a0 = abs_coefficients[0]
+        a1 = abs_coefficients[1]
+        a2 = abs_coefficients[2] if max_order >= 2 else 0
+        
+        max_other = np.max(abs_coefficients[1:]) if len(abs_coefficients) > 1 else 0
+        
+        # Classification logic based on tutor's explanation
+        if dominant_order == 0 and a0 > monopole_threshold * max_other:
+            field_type = "Regular Monopole"
+            confidence = "High"
+            description = f"l=0 (monopole) dominates: a₀={a0:.3e} >> others"
+            
+        elif dominant_order == 1 and a1 > dominance_threshold * a0 and even_odd_ratio < 0.3:
+            field_type = "Pure Dipole"
+            confidence = "High"
+            description = f"l=1 (dipole) dominates: a₁={a1:.3e}, even_power << odd_power"
+            
+        elif 0.3 <= even_odd_ratio <= 3.0 and a0 > 0.1 * a1 and a1 > 0.1 * a0:
+            # Split monopole: both even and odd contribute significantly
+            field_type = "Split Monopole"
+            confidence = "High" if 0.5 <= even_odd_ratio <= 2.0 else "Medium"
+            description = f"Even and odd orders both significant: even/odd={even_odd_ratio:.2f}"
+            
+        elif dominant_order == 2 and a2 > dominance_threshold * max(a0, a1):
+            field_type = "Quadrupole"
+            confidence = "High"
+            description = f"l=2 (quadrupole) dominates: a₂={a2:.3e}"
+            
+        elif dominant_order > 2:
+            field_type = f"Higher Multipole (l={dominant_order})"
+            confidence = "Medium"
+            description = f"l={dominant_order} is dominant order"
+            
+        else:
+            field_type = "Mixed Multipole"
+            confidence = "Low"
+            description = "No single multipole clearly dominates"
+        
+        # Reconstruct B_r from Legendre expansion (for validation)
+        B_r_reconstructed = np.zeros_like(B_r_horizon)
+        for l in range(max_order + 1):
+            P_l = legendre(l)
+            P_l_values = P_l(x)
+            B_r_reconstructed += coefficients[l] * P_l_values
+        
+        # Calculate reconstruction error
+        reconstruction_error = np.sqrt(np.mean((B_r_horizon - B_r_reconstructed)**2))
+        relative_error = reconstruction_error / (np.max(np.abs(B_r_horizon)) + 1e-10)
+        
+        # Package results
+        results = {
+            'coefficients': coefficients,
+            'normalized_coefficients': normalized_coefficients,
+            'dominant_order': int(dominant_order),
+            'field_type': field_type,
+            'description': description,
+            'confidence': confidence,
+            'monopole_strength': float(a0),
+            'dipole_strength': float(a1),
+            'quadrupole_strength': float(a2),
+            'even_power': float(even_power),
+            'odd_power': float(odd_power),
+            'even_odd_ratio': float(even_odd_ratio),
+            'B_r_reconstructed': B_r_reconstructed,
+            'B_r_horizon': B_r_horizon,
+            'theta': theta,
+            'reconstruction_error': float(reconstruction_error),
+            'relative_error': float(relative_error)
+        }
+        
+        return results
 
     def print_topology_summary(self, topo_data):
         """
@@ -1046,7 +1275,7 @@ class MagnetizedAnalysis:
             
             # Get topology data
             flux_data = self.calculate_hemisphere_flux()
-            topo_data = self.detect_field_topology_zero_crossings(
+            topo_data = self.analyze_field_multipoles_legendre(
                 B_r_horizon=flux_data['B_r_horizon'],
                 theta=flux_data['theta']
             )
@@ -1055,46 +1284,44 @@ class MagnetizedAnalysis:
             B_r = flux_data['B_r_horizon']
             
             # Plot B_r(θ) - clean and simple
-            ax.plot(theta, B_r, 'k-', linewidth=2.5)
+            ax.plot(theta, B_r, 'k-', linewidth=2.5, zorder=5, label='Simulation data')
+            # Plot reconstructed field from Legendre decomposition (for validation)
+            if 'B_r_reconstructed' in topo_data:
+                ax.plot(topo_data['theta'], topo_data['B_r_reconstructed'], 
+                        'r--', linewidth=2, alpha=0.7, zorder=4, label='Legendre fit')
+            # Zero line and equator
             ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
             ax.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
             
-            # Mark zero crossings
-            if topo_data['n_crossings'] > 0:
-                for detail in topo_data['crossing_details']:
-                    theta_cross = detail['theta']
-                    crossing_type = detail['type']
-                    
-                    if crossing_type == 'smooth':
-                        color, marker = 'green', 'o'
-                    elif crossing_type == 'discontinuous':
-                        color, marker = 'red', 's'
-                    else:
-                        color, marker = 'orange', '^'
-                    
-                    ax.axvline(x=theta_cross, color=color, linestyle=':', 
-                            alpha=0.6, linewidth=2)
-                    ax.plot(theta_cross, 0, marker=marker, color=color, 
-                        markersize=9, zorder=10)
+            # Color-code plot based on field classification
+            field_type = topo_data.get('field_type', 'Unknown')
+            confidence = topo_data.get('confidence', 'Low')
+            
+            # Map field type to color
+            field_colors = {
+                'Regular Monopole': '#2E7D32',  # Green
+                'Pure Dipole': '#1565C0',       # Blue
+                'Split Monopole': '#C62828',    # Red
+                'Quadrupole': '#F57C00',        # Orange
+                'Mixed Multipole': '#6A1B9A'    # Purple
+            }
+            field_color = field_colors.get(field_type, '#424242')
             
             # Clean formatting
             ax.set_xlabel('θ (rad)', fontsize=11)
             if i == 0:
-                ax.set_ylabel('B_r', fontsize=11)
+                ax.set_ylabel('B_r  [simulation units]', fontsize=11)
             
             # Title: just time and field type
             ax.set_title(f't = {time:.1f} M\n{topo_data["field_type"]}', 
                         fontsize=12, fontweight='bold')
             ax.grid(True, alpha=0.25)
             ax.set_xlim(0, np.pi)
-            ax.set_xticks([0, np.pi/2, np.pi])
-            ax.set_xticklabels(['0', 'π/2', 'π'])
+            ax.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
+            ax.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
             
             # Minimal stats box - just key numbers
-            stats_text = f'n = {topo_data["n_crossings"]}\n'
-            if topo_data['n_crossings'] > 0:
-                stats_text += f'S: {topo_data["dipole_like_crossings"]}  '
-                stats_text += f'D: {topo_data["split_monopole_like_crossings"]}\n'
+            stats_text = f'Field Type: {field_type}\n'
             stats_text += f'Φ_N: {flux_data["flux_north"]:+.2e}\n'
             stats_text += f'Φ_S: {flux_data["flux_south"]:+.2e}'
             
@@ -1121,196 +1348,6 @@ class MagnetizedAnalysis:
             plt.close()
         
         return fig, axes
-
-
-    def plot_Br_theta_snapshot(self, dump_file=None, show=True, save=True):
-        """
-        Detailed plot of B_r(θ) at horizon for a single time.
-        
-        Clean, quantitative visualization with minimal text.
-        
-        Shows:
-        - Panel 1: B_r(θ) profile with crossing markers
-        - Panel 2: dB_r/dθ gradient 
-        - Panel 3: Quantitative summary (numbers only)
-        
-        Parameters:
-        ----------
-        dump_file : str, optional
-            Dump file to analyze. If None, uses currently loaded data.
-        show : bool
-            Whether to display plot
-        save : bool
-            Whether to save to file
-        
-        Returns:
-        -------
-        fig, axes : matplotlib figure and axes
-        """
-
-        # Load data if specified
-        if dump_file is not None:
-            self.load_data("gdump", dump_file)
-        
-        current_time = float(hs.t)
-        
-        # Get field data
-        flux_data = self.calculate_hemisphere_flux()
-        topo_data = self.detect_field_topology_zero_crossings(
-            B_r_horizon=flux_data['B_r_horizon'],
-            theta=flux_data['theta']
-        )
-        
-        theta = flux_data['theta']
-        B_r = flux_data['B_r_horizon']
-        gradient = topo_data['gradient']
-        theta_grad = (theta[:-1] + theta[1:]) / 2
-        
-        # Create figure with clean layout
-        fig = plt.figure(figsize=(14, 9))
-        gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.35)
-        
-        # ========================================================================
-        # Panel 1: B_r(θ) Profile
-        # ========================================================================
-        ax1 = fig.add_subplot(gs[0, :])  # Span both columns
-        
-        # Plot B_r(θ) - simple, clean
-        ax1.plot(theta, B_r, 'k-', linewidth=2.5, zorder=5)
-        ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
-        ax1.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
-        
-        # Mark zero crossings with color coding (minimal)
-        if topo_data['n_crossings'] > 0:
-            for detail in topo_data['crossing_details']:
-                theta_cross = detail['theta']
-                crossing_type = detail['type']
-                
-                # Color code by type
-                if crossing_type == 'smooth':
-                    color = 'green'
-                    marker = 'o'
-                elif crossing_type == 'discontinuous':
-                    color = 'red'
-                    marker = 's'
-                else:
-                    color = 'orange'
-                    marker = '^'
-                
-                ax1.axvline(x=theta_cross, color=color, linestyle=':', 
-                        alpha=0.6, linewidth=2, zorder=3)
-                ax1.plot(theta_cross, 0, marker=marker, color=color, 
-                        markersize=10, zorder=10)
-        
-        ax1.set_xlabel('θ (rad)', fontsize=13)
-        ax1.set_ylabel('B_r', fontsize=13)
-        ax1.set_title(f'B_r(θ) at Horizon | t = {current_time:.1f} M', 
-                    fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.25)
-        ax1.set_xlim(0, np.pi)
-        ax1.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
-        ax1.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
-        
-        # Minimal legend
-        if topo_data['n_crossings'] > 0:
-            from matplotlib.lines import Line2D
-            legend_elements = []
-            if topo_data['dipole_like_crossings'] > 0:
-                legend_elements.append(Line2D([0], [0], marker='o', color='w', 
-                                            markerfacecolor='green', markersize=8, 
-                                            label='Smooth'))
-            if topo_data['split_monopole_like_crossings'] > 0:
-                legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                            markerfacecolor='red', markersize=8, 
-                                            label='Discontinuous'))
-            if legend_elements:
-                ax1.legend(handles=legend_elements, loc='upper right', 
-                        fontsize=10, framealpha=0.9)
-        
-        # ========================================================================
-        # Panel 2: Gradient dB_r/dθ
-        # ========================================================================
-        ax2 = fig.add_subplot(gs[1, 0])
-        
-        ax2.plot(theta_grad, gradient, 'b-', linewidth=2)
-        ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
-        ax2.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
-        
-        # Highlight discontinuous crossings
-        if topo_data['split_monopole_like_crossings'] > 0:
-            for detail in topo_data['crossing_details']:
-                if detail['type'] == 'discontinuous':
-                    theta_cross = detail['theta']
-                    ax2.axvspan(theta_cross - 0.1, theta_cross + 0.1, 
-                            alpha=0.2, color='red')
-        
-        ax2.set_xlabel('θ (rad)', fontsize=12)
-        ax2.set_ylabel('dB_r/dθ', fontsize=12)
-        ax2.set_title('Gradient', fontsize=13, fontweight='bold')
-        ax2.grid(True, alpha=0.25)
-        ax2.set_xlim(0, np.pi)
-        ax2.set_xticks([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi])
-        ax2.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
-        
-        # ========================================================================
-        # Panel 3: Quantitative Summary (Numbers Only!)
-        # ========================================================================
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax3.axis('off')
-        
-        # Clean, tabular format - just the numbers
-        summary_text = f"{topo_data['field_type']}\n"
-        summary_text += "─" * 28 + "\n\n"
-        
-        summary_text += f"Crossings:          {topo_data['n_crossings']}\n"
-        if topo_data['n_crossings'] > 0:
-            summary_text += f"  Smooth:           {topo_data['dipole_like_crossings']}\n"
-            summary_text += f"  Discontinuous:    {topo_data['split_monopole_like_crossings']}\n\n"
-        else:
-            summary_text += "\n"
-        
-        summary_text += f"Φ_N:    {flux_data['flux_north']:+.3e}\n"
-        summary_text += f"Φ_S:    {flux_data['flux_south']:+.3e}\n"
-        summary_text += f"Φ_tot:  {flux_data['flux_total']:+.3e}\n\n"
-        
-        summary_text += f"B_r(0):    {topo_data['pole_field']:+.3e}\n"
-        summary_text += f"B_r(π/2):  {topo_data['equator_field']:+.3e}\n"
-        
-        # Add crossing details if present
-        if topo_data['n_crossings'] > 0:
-            summary_text += "\n" + "─" * 28 + "\n"
-            for i, detail in enumerate(topo_data['crossing_details']):
-                summary_text += f"\nCrossing {i+1}:\n"
-                summary_text += f"  θ = {detail['theta']:.4f} rad\n"
-                summary_text += f"  Type: {detail['type']}\n"
-                summary_text += f"  Width: {detail['transition_width']} cells\n"
-                summary_text += f"  Grad ratio: {detail['gradient_discontinuity_ratio']:.2f}\n"
-        
-        ax3.text(0.05, 0.95, summary_text, transform=ax3.transAxes,
-                fontsize=10, verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle="round,pad=0.5", facecolor="white", 
-                        edgecolor='gray', alpha=0.95, linewidth=1.5))
-        
-        # Clean overall title
-        fig.suptitle(f'{topo_data["field_type"]}', 
-                    fontsize=15, fontweight='bold')
-        
-        plt.tight_layout()
-        
-        # Save
-        if save:
-            safe_time = f"{current_time:.0f}".replace(".", "_")
-            filename = os.path.join(self.output_dir, 
-                                f"Br_theta_snapshot_t{safe_time}.png")
-            plt.savefig(filename, dpi=200, bbox_inches='tight')
-            print(f"Saved B_r(θ) snapshot: {filename}")
-        
-        if show:
-            plt.show()
-        else:
-            plt.close()
-        
-        return fig, (ax1, ax2, ax3)
 
     def validate_omega_ratio(self, omega_data, tolerance=0.15):
         """
@@ -1899,11 +1936,9 @@ class MagnetizedAnalysis:
         else:
             plt.close()
     
-    def plot_2d_monopole_results(self, results, field_type="Auto", show=True):
+    def plot_2d_monopole_results(self, results, field_type="Auto", problem_name="", show=True):
         """
         Plot 2D BZ analysis results with precise ΩF/ΩH reporting at horizon.
-        
-        SESSION 2 UPDATE: Shows exact ΩF/ΩH values with error bars, no vague language.
         """
         if not results['times']:
             print("No results to plot!")
@@ -1919,7 +1954,6 @@ class MagnetizedAnalysis:
         print(f"Detected field type: {field_type}")
         
         fig = plt.figure(figsize=(16, 12))
-        from matplotlib.gridspec import GridSpec
         gs = GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
         
         # 1. Power extraction evolution
@@ -2001,7 +2035,7 @@ class MagnetizedAnalysis:
             ax2.set_ylim(-50, 50)
             ax2.set_aspect('equal')
             
-            cbar2 = plt.colorbar(im, ax=ax2, label='log10(density)', shrink=0.8)
+            cbar2 = plt.colorbar(im, ax=ax2, label='density', shrink=0.8)
         
         # 3. ΩF(θ)/ΩH profile at horizon - PRECISE REPORTING
         ax3 = fig.add_subplot(gs[1, 0])
@@ -2249,7 +2283,7 @@ class MagnetizedAnalysis:
         output_path = os.path.join(self.output_dir, output_file)
         try:
             ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
-            print(f"Saved enhanced 2D density animation: {output_path}")
+            print(f"Saved  2D density animation: {output_path}")
             print(f"Animation duration: {len(sampled_files)/fps:.1f} seconds")
         except Exception as e:
             print(f"Error saving animation: {e}")
@@ -3085,11 +3119,11 @@ class MagnetizedAnalysis:
         """
         Two-panel animation: B_r(θ) profile + Hemisphere flux evolution
         
-        Panel 1: B_r(θ) at horizon with zero-crossing detection
+        Panel 1: B_r(θ) at horizon with Legendre polynomial decomposition
         Panel 2: Northern & Southern hemisphere flux time series
         
         Features:
-        - Zero-crossing detection (smooth vs discontinuous)
+        - Legendre polynomial decomposition (proper multipole identification)
         - Hemisphere flux tracking
         - Clean, informative visualization
         - Variable sampling: detailed early, overview late (if enabled)
@@ -3143,7 +3177,7 @@ class MagnetizedAnalysis:
             
             # Get field data
             flux_data = self.calculate_hemisphere_flux()
-            topo_data = self.detect_field_topology_zero_crossings(
+            topo_data = self.analyze_field_multipoles_legendre(
                 B_r_horizon=flux_data['B_r_horizon'],
                 theta=flux_data['theta']
             )
@@ -3152,29 +3186,30 @@ class MagnetizedAnalysis:
             B_r = flux_data['B_r_horizon']
             
             # PANEL 1: B_r(θ) Profile
-            ax1.plot(theta, B_r, 'k-', linewidth=3, zorder=5)
+            ax1.plot(theta, B_r, 'k-', linewidth=3, zorder=5, label='Simulation data')
+
+            # Plot reconstructed field from Legendre decomposition (for validation)
+            if 'B_r_reconstructed' in topo_data:
+                ax1.plot(topo_data['theta'], topo_data['B_r_reconstructed'], 
+                        'r--', linewidth=2, alpha=0.7, zorder=4, label='Legendre fit')
             
             # Zero line and equator
             ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
             ax1.axvline(x=np.pi/2, color='gray', linestyle=':', alpha=0.3, linewidth=1.5)
             
-            # Mark zero crossings
-            if topo_data['n_crossings'] > 0:
-                for detail in topo_data['crossing_details']:
-                    theta_cross = detail['theta']
-                    crossing_type = detail['type']
-                    
-                    if crossing_type == 'smooth':
-                        color, marker, size = 'green', 'o', 12
-                    elif crossing_type == 'discontinuous':
-                        color, marker, size = 'red', 's', 12
-                    else:
-                        color, marker, size = 'orange', '^', 12
-                    
-                    ax1.axvline(x=theta_cross, color=color, linestyle=':',
-                            alpha=0.6, linewidth=2.5, zorder=3)
-                    ax1.plot(theta_cross, 0, marker=marker, color=color,
-                            markersize=size, zorder=10)
+            # Color-code plot based on field classification
+            field_type = topo_data.get('field_type', 'Unknown')
+            confidence = topo_data.get('confidence', 'Low')
+            
+            # Map field type to color
+            field_colors = {
+                'Regular Monopole': '#2E7D32',  # Green
+                'Pure Dipole': '#1565C0',       # Blue
+                'Split Monopole': '#C62828',    # Red
+                'Quadrupole': '#F57C00',        # Orange
+                'Mixed Multipole': '#6A1B9A'    # Purple
+            }
+            field_color = field_colors.get(field_type, '#424242')
             
             # Formatting
             ax1.set_xlabel('θ', fontsize=12)
@@ -3185,37 +3220,32 @@ class MagnetizedAnalysis:
             ax1.set_xticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
             ax1.tick_params(labelsize=10)
             
-            # IMPROVED TITLE: No premature classification, just observations
-            ax1.set_title(f'B_r(θ) at Horizon  |  t = {current_time:.1f}M',
-                        fontsize=13, fontweight='bold', pad=10)
+            # Title with field classification
+            ax1.set_title(f'B_r(θ) at Horizon  |  t = {current_time:.1f}M  |  {field_type}',
+                        fontsize=13, fontweight='bold', pad=10, color=field_color)
             
-            # Stats box - MOVED TO LEFT
-            stats_text = f'Crossings: {topo_data["n_crossings"]}\n'
-            if topo_data['n_crossings'] > 0:
-                stats_text += f'  Smooth: {topo_data["dipole_like_crossings"]}\n'
-                stats_text += f'  Discontinuous: {topo_data["split_monopole_like_crossings"]}\n'
-            stats_text += f'Φ_North: {flux_data["flux_north"]:+.2e}\n'
-            stats_text += f'Φ_South: {flux_data["flux_south"]:+.2e}'
+            # Stats box with Legendre analysis results
+            dominant_l = topo_data.get('dominant_order', 0)
+            even_odd_ratio = topo_data.get('even_odd_ratio', 1.0)
+            monopole_strength = topo_data.get('monopole_strength', 0)
+            dipole_strength = topo_data.get('dipole_strength', 0)
+            
+            stats_text = f'Field Type: {field_type}\n'
+            stats_text += f'Confidence: {confidence}\n'
+            stats_text += f'Dominant l: {dominant_l}\n'
+            stats_text += f'Even/Odd: {even_odd_ratio:.3f}\n'
+            stats_text += f'|a₀|: {monopole_strength:.2e}\n'
+            stats_text += f'|a₁|: {dipole_strength:.2e}\n'
+            stats_text += f'Î¦_N: {flux_data["flux_north"]:+.2e}\n'
+            stats_text += f'Î¦_S: {flux_data["flux_south"]:+.2e}'
             
             ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes,
                     fontsize=9, verticalalignment='top', fontfamily='monospace',
                     bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                            edgecolor='gray', alpha=0.9, linewidth=1))
+                            edgecolor=field_color, alpha=0.9, linewidth=2))
             
-            # Legend for crossing types - MOVED TO RIGHT
-            if topo_data['n_crossings'] > 0:
-                legend_elements = []
-                if topo_data['dipole_like_crossings'] > 0:
-                    legend_elements.append(Line2D([0], [0], marker='o', color='w',
-                                                markerfacecolor='green', markersize=9,
-                                                label='Smooth'))
-                if topo_data['split_monopole_like_crossings'] > 0:
-                    legend_elements.append(Line2D([0], [0], marker='s', color='w',
-                                                markerfacecolor='red', markersize=9,
-                                                label='Discontinuous'))
-                if legend_elements:
-                    ax1.legend(handles=legend_elements, loc='upper right',
-                            fontsize=9, framealpha=0.9, title='Zero Crossings')
+            # Adaptive legend placement
+            ax1.legend(loc='best', fontsize=9, framealpha=0.9)
             
             # Dynamic y-axis to show B_r decay
             Br_max_history.append(np.abs(B_r).max())
@@ -3268,7 +3298,7 @@ class MagnetizedAnalysis:
 
 
     def generate_all_animations(self, dump_files, output_dir=None, fps=10, 
-                            early_resolution_boost=True):
+                            early_resolution_boost=True, problem_name=""):
         """
         Convenience method to generate all three animations at once
         
@@ -3282,34 +3312,38 @@ class MagnetizedAnalysis:
             Frames per second
         early_resolution_boost : bool
             If True, uses variable sampling (detailed early, faster late)
+        problem_name : str, optional
+            Problem name to include in filenames (e.g., "bz_monopole")
         """
         if output_dir is None:
             output_dir = self.output_dir
         
+        # Create problem suffix for filenames
+        suffix = f"_{problem_name}" if problem_name else ""
+        
         print("\n" + "="*70)
-        print("GENERATING COMPLETE ANIMATION SUITE")
+        print(f"GENERATING COMPLETE ANIMATION SUITE{' FOR ' + problem_name.upper() if problem_name else ''}")
         print("="*70)
         
-        # Updated animation definitions with new method names
         animations = [
-            ("velocity_stagnation.mp4",
+            (f"velocity_stagnation{suffix}.mp4",
             lambda df, out: self.create_velocity_and_stagnation_animation(
                 df, out, fps=fps, early_resolution_boost=early_resolution_boost)),
             
-            ("energy_zones.mp4",
+            (f"energy_zones{suffix}.mp4",
             lambda df, out: self.create_energy_zones_animation(
                 df, out, fps=fps, early_resolution_boost=early_resolution_boost)),
             
-            ("magnetic_topology.mp4",
+            (f"magnetic_topology{suffix}.mp4",
             lambda df, out: self.create_magnetic_topology_animation(
                 df, out, fps=fps, early_resolution_boost=early_resolution_boost)),
         ]
         
         for filename, method in animations:
-            output_path = os.path.join(output_dir, filename)
+            # ✅ Pass ONLY filename, not full path
             print(f"\n>>> Creating: {filename}")
             try:
-                method(dump_files, output_path)
+                method(dump_files, filename)  # ✅ Just filename
                 print(f"✓ Success: {filename}")
             except Exception as e:
                 print(f"✗ Failed: {filename}")
@@ -3330,6 +3364,80 @@ class MagnetizedAnalysis:
             else:
                 print(f"  ✗ {filename} (not found)")
 
+    def show_all_animations(self, animation_files, problem_label, save=True, show=True):
+        """
+        Combine all animation outputs (energy zones, magnetic topology, velocity stagnation)
+        into a single multi-panel figure for simultaneous viewing.
+        
+        This creates a unified visualization that shows all three key aspects of the
+        magnetized accretion simulation side-by-side, making it easier to identify
+        correlations and overall system behavior.
+        
+        Args:
+            animation_files (dict): Dictionary of file paths, e.g.:
+                {
+                    'energy_zones': 'path/to/energy_zones.mp4',
+                    'magnetic_topology': 'path/to/magnetic_topology.mp4',
+                    'velocity_stagnation': 'path/to/velocity_stagnation.mp4'
+                }
+            problem_label (str): Description of the analyzed configuration (e.g., "bz_monopole")
+            save (bool): Whether to save the combined figure
+            show (bool): Whether to display the result
+        
+        Returns:
+            fig: The created matplotlib figure
+        
+        Example:
+            >>> analyzer = MagnetizedAnalysis()
+            >>> anim_files = {
+            ...     'energy_zones': './magnetized_plots/energy_zones.mp4',
+            ...     'magnetic_topology': './magnetized_plots/magnetic_topology.mp4',
+            ...     'velocity_stagnation': './magnetized_plots/velocity_stagnation.mp4'
+            ... }
+            >>> analyzer.show_all_animations(anim_files, "BZ Monopole")
+        """
+        
+        fig = plt.figure(figsize=(18, 6))
+        gs = GridSpec(1, 3, figure=fig, wspace=0.05)
+        
+        titles = {
+            'energy_zones': 'Energy Zones',
+            'magnetic_topology': 'Magnetic Topology',
+            'velocity_stagnation': 'Velocity & Stagnation'
+        }
+        
+        for i, key in enumerate(['energy_zones', 'magnetic_topology', 'velocity_stagnation']):
+            ax = fig.add_subplot(gs[0, i])
+            ax.set_title(titles[key], fontsize=14, fontweight='bold', pad=10)
+            ax.axis('off')
+            
+            if key in animation_files and os.path.exists(animation_files[key]):
+                # For video files, we can show the first frame or a representative frame
+                # Note: This would require video processing. For now, show placeholder.
+                ax.text(0.5, 0.5, 
+                       f'{titles[key]}\n\nVideo available at:\n{os.path.basename(animation_files[key])}',
+                       ha='center', va='center', fontsize=11, 
+                       bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.7))
+            else:
+                ax.text(0.5, 0.5, f"No data for {key}", 
+                       ha='center', va='center', fontsize=12, color='gray')
+        
+        fig.suptitle(f"Combined BZ Analysis - {problem_label}", 
+                    fontsize=18, fontweight='bold', y=0.98)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        if save:
+            safe_label = problem_label.replace(' ', '_').replace('/', '_')
+            out_path = os.path.join(self.output_dir, f"combined_animations_{safe_label}.png")
+            plt.savefig(out_path, dpi=150, bbox_inches='tight')
+            print(f"\nSaved combined animation panel to: {out_path}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        
+        return fig
 
     def analyze_magnetic_hair_loss(self, dump_files, sample_every=5):
         """
@@ -3380,7 +3488,7 @@ class MagnetizedAnalysis:
         -------
         dict : {
             'field_strength_horizon': List of B-field magnitudes at r_h
-            'field_topology_ratio': Pole/equator field ratio vs time
+            'field_topology_ratio': Pole/equator field ratio vs time #TODO: update documentation
             'frame_dragging_efficiency': ΩF/ΩH vs time
             'magnetic_flux_conservation': Φ(t)/Φ(0)
         }
@@ -3399,11 +3507,11 @@ class MagnetizedAnalysis:
             'times': [],
             'field_strength_horizon': [],
             'field_topology_ratio': [],
-            'frame_dragging_efficiency': [],  # FIXED: Now stores horizon values
-            'frame_dragging_evolution': [],  # FIXED: Full evolution data
+            'frame_dragging_efficiency': [],  # Now stores horizon values
+            'frame_dragging_evolution': [],  # Full evolution data
             'magnetic_flux_conservation': [],
-            'hemisphere_flux_evolution': [],  # ← Session 3 addition: # Φ_N, Φ_S over time
-            'topology_evolution': []         # ← Session 3 addition: # Field classification over time
+            'hemisphere_flux_evolution': [],  #  Φ_N, Φ_S over time
+            'topology_evolution': []         # Field classification over time
 
         }
         
@@ -3478,23 +3586,26 @@ class MagnetizedAnalysis:
                         'field_type': flux_data['field_type']
                     })
                     
-                    topo_data = self.detect_field_topology_zero_crossings(
+                    # Use Legendre polynomial decomposition for proper multipole identification
+                    topo_data = self.analyze_field_multipoles_legendre(
                         B_r_horizon=flux_data['B_r_horizon'],
                         theta=flux_data['theta']
                     )
                     
                     results['topology_evolution'].append({
                         'time': current_time,
-                        'n_crossings': topo_data['n_crossings'],
                         'field_type': topo_data['field_type'],
-                        'consistent': topo_data['consistent_with_hemisphere']
+                        'dominant_order': topo_data['dominant_order'],
+                        'even_odd_ratio': topo_data['even_odd_ratio'],
+                        'confidence': topo_data['confidence']
                     })
                     
-                    # Enhanced print (includes field type now)
+                    # Enhanced print with Legendre classification
                     omega_str = f"{frame_drag_eff:.4f}" if (frame_drag_eff is not None and not np.isnan(frame_drag_eff)) else "N/A"
                     print(f"t={current_time:.1f}: B_horizon={horizon_field_strength:.2e}, "
                         f"topology={topology_ratio:.2f}, ΩF/ΩH={omega_str}, "
-                        f"field={flux_data['field_type']}")  # ← NEW: shows field classification
+                        f"hemisphere={flux_data['field_type']}, "
+                        f"Legendre: {topo_data['field_type']} (l={topo_data['dominant_order']}, even/odd={topo_data['even_odd_ratio']:.2f})")
                     
                 except Exception as e:
                     print(f"Warning: Could not calculate hemisphere flux: {e}")
@@ -3520,20 +3631,24 @@ class MagnetizedAnalysis:
         
         return results
 
-    def plot_hair_loss_analysis(self, results, field_type="Auto", show=True):
+    def plot_hair_loss_analysis(self, results, field_type="Auto", problem_name="", show=True):
         """
-        Enhanced hair loss analysis plot with hemisphere flux and topology.
-        
-        SESSION 3 UPDATE: Adds hemisphere flux evolution and field classification.
+        Comprehensive hair loss analysis plot with hemisphere flux evolution and topology.
         
         Creates 2x3 grid:
         - Row 1: Field strength, Hemisphere flux, Field topology
         - Row 2: Frame dragging, Flux conservation, Summary
+                
+        Args:
+            results: Analysis results dictionary
+            field_type: Field type classification (Auto-detected if "Auto")
+            problem_name: Problem name to display in title (e.g., "bz_monopole")
+            show: Whether to display the plot
         """
         if not results['times']:
             return
         
-        # Auto-detect field type
+        # Auto-detect field type TODO: replace this method with getting the field configuration from self
         if field_type == "Auto" and results['times']:
             dump_files = get_dump_files()
             if dump_files:
@@ -3541,7 +3656,7 @@ class MagnetizedAnalysis:
         
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         
-        # Dynamic title
+        # Dynamic title with problem name
         title_map = {
             "Monopole": "Magnetic Field Evolution: 2D Monopole",
             "Dipole": "Magnetic Field Evolution: 2D Dipole", 
@@ -3551,6 +3666,11 @@ class MagnetizedAnalysis:
         }
         
         title = title_map.get(field_type, f"Magnetic Field Evolution: {field_type}")
+        
+        # Add problem name if provided
+        if problem_name:
+            title = f"{title} - Problem: {problem_name}"
+        
         fig.suptitle(title, fontsize=16, fontweight='bold')
         
         times = results['times']
@@ -3578,7 +3698,7 @@ class MagnetizedAnalysis:
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.9))
         
         # ========================================================================
-        # Panel 2: Hemisphere Flux Evolution (NEW!)
+        # Panel 2: Hemisphere Flux Evolution
         # ========================================================================
         ax2 = axes[0, 1]
         
@@ -3620,10 +3740,10 @@ class MagnetizedAnalysis:
             ax2.set_title('Hemisphere Flux Evolution', fontsize=13, fontweight='bold')
         
         # ========================================================================
-        # Panel 3: Field Topology Evolution (NEW!)
+        # Panel 3: Field Topology Evolution #TODO: replace this panel with a more physically and visually informative plot
         # ========================================================================
-        ax3 = axes[0, 2]
-        
+        ax3 = axes[0, 2] #TODO: Change this plot to display some Legendre instead!
+        # TODO: replace the crossings display with Legendre polynomials 
         if results.get('topology_evolution'):
             topo_times = [d['time'] for d in results['topology_evolution'] if d is not None]
             n_crossings = [d['n_crossings'] for d in results['topology_evolution'] if d is not None]
@@ -3641,7 +3761,7 @@ class MagnetizedAnalysis:
                 ax3.axhline(y=1, color='orange', linestyle='--', alpha=0.3, linewidth=1.5)
                 ax3.axhline(y=2, color='red', linestyle='--', alpha=0.3, linewidth=1.5)
                 
-                # Labels
+                # Labels TODO: add colormap for topology classification
                 ax3.text(times[-1]*0.95, 0, ' Monopole', fontsize=9, va='center', color='blue')
                 ax3.text(times[-1]*0.95, 1, ' Split', fontsize=9, va='center', color='orange')
                 ax3.text(times[-1]*0.95, 2, ' Dipole', fontsize=9, va='center', color='red')
@@ -3752,7 +3872,7 @@ class MagnetizedAnalysis:
                 summary_text += f"Φ_N: {final_flux['flux_north']:+.2e}\n"
                 summary_text += f"Φ_S: {final_flux['flux_south']:+.2e}\n\n"
 
-        if results.get('topology_evolution'):
+        if results.get('topology_evolution'): #TODO: replace logic with Legendre method call!
             final_topo = results['topology_evolution'][-1]
             if final_topo:
                 summary_text += f"Crossings: {final_topo['n_crossings']}\n"
@@ -3773,9 +3893,9 @@ class MagnetizedAnalysis:
         # Save
         safe_field_type = field_type.lower().replace('/', '_').replace(' ', '_')
         filename = os.path.join(self.output_dir, 
-                            f"magnetic_hair_loss_enhanced_{safe_field_type}.png")
+                            f"magnetic_hair_loss_{safe_field_type}.png")
         plt.savefig(filename, dpi=200, bbox_inches='tight')
-        print(f"Saved enhanced hair loss analysis: {filename}")
+        print(f"Saved hair loss analysis: {filename}")
         
         if show:
             plt.show()
@@ -3868,54 +3988,68 @@ def handle_animation_requests(analyzer, args, dump_files):
     """
     Handle all animation-related requests
     Returns True if handled (should exit), False otherwise
+    # TODO: add frame dragging animation, add comprehensive "show all animations" for bz problems
     """
     if args.animations:
         print("\n=== GENERATING ALL ANIMATIONS ===")
         analyzer.generate_all_animations(
             dump_files,
             fps=args.fps,
-            early_resolution_boost=True
+            early_resolution_boost=True,
+            problem_name=args.problem
         )
         print(f"✓ All animations saved to: {args.output}")
         return True
     
     if args.stag_anim:
         print("\n=== GENERATING VELOCITY & STAGNATION ANIMATION ===")
-        output = os.path.join(args.output, "velocity_stagnation.mp4")
+        filename = f"velocity_stagnation_{args.problem}.mp4"
         analyzer.create_velocity_and_stagnation_animation(
-            dump_files, output_file=output, fps=args.fps
+            dump_files, output_file=filename, fps=args.fps
         )
-        print(f"✓ Saved to: {output}")
+        output_path = os.path.join(args.output, filename)
+        print(f"✓ Saved to: {output_path}")
         return True
     
     if args.energy_anim:
         print("\n=== GENERATING ENERGY ZONES ANIMATION ===")
-        output = os.path.join(args.output, "energy_zones.mp4")
+        filename = f"energy_zones_{args.problem}.mp4"
         analyzer.create_energy_zones_animation(
-            dump_files, output_file=output, fps=args.fps
+            dump_files, output_file=filename, fps=args.fps
         )
-        print(f"✓ Saved to: {output}")
+        output_path = os.path.join(args.output, filename)
+        print(f"✓ Saved to: {output_path}")
         return True
     
     if args.mag_anim:
         print("\n=== GENERATING MAGNETIC TOPOLOGY ANIMATION ===")
-        output = os.path.join(args.output, "magnetic_topology.mp4")
+        filename = f"magnetic_topology_{args.problem}.mp4"
         analyzer.create_magnetic_topology_animation(
-            dump_files, output_file=output, fps=args.fps
+            dump_files, output_file=filename, fps=args.fps
         )
-        print(f"✓ Saved to: {output}")
+        output_path = os.path.join(args.output, filename)
+        print(f"✓ Saved to: {output_path}")
         return True
     
     return False
 
-
+# TODO: implement analysis requests handling logic! whether standard, hair loss or extended monopole (the latter will be implemented in the future)
 def handle_analysis_requests(analyzer, args, dump_files):
     """
-    Handle standard analysis requests
-    Returns True if handled, False otherwise
+    Handle standard analysis requests.
+    Dispatches the appropriate analysis based on command-line arguments.
+    
+    Returns True if handled (should exit), False otherwise
+    
+    Args:
+        analyzer: MagnetizedAnalysis instance
+        args: Parsed command-line arguments
+        dump_files: List of dump files to analyze
     """
     # Add your analysis handling here if needed
     # For now, return False (no early exit)
+    # If no specific analysis requested, return False to continue to default
+    # (This allows default behavior in main() when no flags are set)
     return False
 
 
@@ -3939,15 +4073,16 @@ Examples:
         """
     )
     
-    # Core options (keep these)
+    # Core options
     parser.add_argument('--problem', type=str, default='bz_monopole',
-                       choices=['bondi_1d', 'bondi_2d', 'monopole_2d', 'bz_monopole'],
-                       help='Problem type to analyze')
-    
+                       choices=['monopole_1d', 'monopole_2d', 'bz_monopole', 'bz_dipole', 'bz_split_monopole'],
+                       help='Problem type / field configuration to analyze')
     parser.add_argument('--output', type=str, default='./magnetized_plots',
                        help='Output directory for results')
+    parser.add_argument('--hair-loss', action='store_true',
+                       help='Run black hole "hair loss" analysis (SOMA 2017 style)')
     
-    # Animation options
+    # Animation options TODO: add frame dragging animation
     anim_group = parser.add_argument_group('Animation Options')
     anim_group.add_argument('--animations', action='store_true',
                            help='Generate all animations')
@@ -3960,7 +4095,7 @@ Examples:
     anim_group.add_argument('--fps', type=int, default=10,
                            help='Frames per second for animations (default: 10)')
     
-    # Analysis options (if you use them)
+    # Analysis options (if you use them) TODO: add more analysis options?
     analysis_group = parser.add_argument_group('Analysis Options')
     analysis_group.add_argument('--sample', type=int, default=5,
                                help='Sample every N-th dump file for analysis')
@@ -3993,23 +4128,83 @@ def main():
     print(f"Range: {dump_files[0]} to {dump_files[-1]}")
     
     # ========================================================================
-    # PRIORITY 1: Handle animation requests (exit after completion)
+    # PRIORITY 1: Handle hair loss analysis (if requested) TODO: move to handle_analysis_requests!
+    # ========================================================================
+    if args.hair_loss:
+        print(f"\n{'='*70}")
+        print("BLACK HOLE 'HAIR LOSS' ANALYSIS (SOMA 2017)")
+        print(f"{'='*70}")
+        print(f"Problem configuration: {args.problem}")
+        
+        # Determine field type label from problem name (BZ)
+        field_labels = {
+            'bz_monopole': 'Monopole',
+            'bz_dipole': 'Dipole',
+            'bz_split_monopole': 'Split Monopole'
+        }
+        expected_field = field_labels.get(args.problem, 'Auto')
+        
+        # Run hair loss analysis
+        hair_results = analyzer.analyze_magnetic_hair_loss(dump_files, sample_every=args.sample)
+        
+        # Use detected field type or expected from problem name
+        if hair_results['times']:
+            detected_type = analyzer.detect_field_type(dump_files[-1])
+            print(f"\nExpected field type: {expected_field}")
+            print(f"Detected field type: {detected_type}")
+            
+            # Use expected field type for labeling (from --problem flag)
+            field_type_label = expected_field
+        else:
+            field_type_label = "Unknown"
+        
+        # Generate enhanced plots
+        analyzer.plot_hair_loss_analysis(hair_results, field_type=field_type_label)
+        
+        # Print validation summary
+        if hair_results['frame_dragging_efficiency']:
+            valid_omega = [x for x in hair_results['frame_dragging_efficiency'] 
+                          if x is not None and not np.isnan(x)]
+            if valid_omega:
+                avg_omega = np.mean(valid_omega)
+                std_omega = np.std(valid_omega)
+                deviation = abs(avg_omega - 0.5) / 0.5 * 100
+                print(f"\n{'='*70}")
+                print("SUMMARY")
+                print(f"{'='*70}")
+                print(f"Average ΩF/ΩH = {avg_omega:.4f} ± {std_omega:.4f}")
+                print(f"Theory (monopole) = 0.500")
+                print(f"Deviation: {deviation:.1f}%")
+                if deviation < 5:
+                    print("✓ Excellent agreement with BZ mechanism")
+                elif deviation < 10:
+                    print("✓ Good agreement with BZ mechanism")
+                else:
+                    print("⚠ Significant deviation - check resolution/boundary conditions")
+            else:
+                print("\n⚠ ΩF/ΩH data contains only NaN values")
+        
+        print(f"\n✓ Results saved to: {args.output}")
+        return  # Exit after hair loss analysis
+
+    # ========================================================================
+    # PRIORITY 2: Handle animation requests (exit after completion)
     # ========================================================================
     if handle_animation_requests(analyzer, args, dump_files):
         return  # Animation generated, exit
     
     # ========================================================================
-    # PRIORITY 2: Handle analysis requests
+    # PRIORITY 3: Handle analysis requests
     # ========================================================================
     if handle_analysis_requests(analyzer, args, dump_files):
         return  # Analysis complete, exit
     
     # ========================================================================
-    # DEFAULT: Run standard analysis for the specified problem
+    # DEFAULT: Run standard analysis for the specified problem NOTE: keep here? or move to handle_analysis_requests?
     # ========================================================================
     print(f"\n=== ANALYZING {args.problem.upper()} ===")
     
-    if args.problem in ['bz_monopole', 'monopole_2d']:
+    if args.problem in ['monopole_1d', 'monopole_2d', 'bz_monopole', 'bz_dipole', 'bz_split_monopole']:
         # Detect field type
         detected_type = analyzer.detect_field_type(dump_files[-1])
         print(f"Detected field type: {detected_type}")
@@ -4017,7 +4212,17 @@ def main():
         # Run 2D monopole analysis
         results = analyzer.analyze_2d_monopole(dump_files, sample_every=args.sample)
         analyzer.plot_2d_monopole_results(results, field_type=detected_type)
-        
+        # Generate animations for full analysis
+        print(f"\n{'='*70}")
+        print(f"GENERATING ANIMATIONS FOR {args.problem.upper()}")
+        print(f"{'='*70}")
+        analyzer.generate_all_animations(
+            dump_files,
+            fps=10,
+            early_resolution_boost=True,
+            problem_name=args.problem
+        )
+
         print(f"\n✓ Analysis complete!")
         print(f"Results saved to: {args.output}")
     

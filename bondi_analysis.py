@@ -199,6 +199,7 @@ class BondiAnalysis:
         """
         Analyze 2D sonic surface tracking min, max, avg radii, 
         plus upstream and downstream radii for BHL scenarios.
+        Now includes proper handling for angular momentum (v_phi).
         """
         results = []
         
@@ -207,6 +208,16 @@ class BondiAnalysis:
             
             r = hs.r.squeeze()
             v1p = hs.v1p.squeeze()
+            
+            # Check if we have azimuthal velocity (angular momentum case)
+            has_vphi = hasattr(hs, 'v3p') and hs.v3p is not None
+            if has_vphi:
+                v3p = hs.v3p.squeeze()
+            
+            # Calculate sound speed for Mach number
+            P = hs.pg.squeeze()
+            rho = hs.rho.squeeze()
+            c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
             
             # Find sonic point at each angle
             sonic_radii = []
@@ -217,9 +228,20 @@ class BondiAnalysis:
             for j in range(n_theta):
                 r_slice = r[:, j]
                 v1p_slice = v1p[:, j]
+                c_s_slice = c_s[:, j]
                 
-                # Find sign change (sonic point)
-                sign_changes = np.where(v1p_slice[:-1] * v1p_slice[1:] < 0)[0]
+                if has_vphi:
+                    # Angular momentum case: use total Mach number
+                    v3p_slice = v3p[:, j]
+                    v_total = np.sqrt(v1p_slice**2 + v3p_slice**2)
+                    mach_slice = v_total / c_s_slice
+                    
+                    # Find where Mach crosses 1
+                    mach_diff = mach_slice - 1.0
+                    sign_changes = np.where(mach_diff[:-1] * mach_diff[1:] < 0)[0]
+                else:
+                    # Pure Bondi/BHL case: use radial velocity sign change
+                    sign_changes = np.where(v1p_slice[:-1] * v1p_slice[1:] < 0)[0]
                 
                 if len(sign_changes) > 0:
                     sonic_r = r_slice[sign_changes[0]]
@@ -322,16 +344,26 @@ class BondiAnalysis:
         """
         Create 2D map with sonic surface contour.
         Shows full circle with mirrored domain.
+        Now supports angular momentum scenarios.
         """
         self.load_data("gdump", dump_file)
         
-        # Calculate velocity magnitude for background (sonic surface is about VELOCITY!)
-        v1p = hs.v1p.squeeze()  # Lab frame radial velocity - THIS is what works!
+        # Check if we have azimuthal velocity (angular momentum case)
+        has_vphi = hasattr(hs, 'v3p') and hs.v3p is not None
+        
+        # Calculate velocity components
+        v1p = hs.v1p.squeeze()  # Lab frame radial velocity
         u_r = (hs.uu[1] / hs.uu[0]).squeeze()
         u_theta = (hs.uu[2] / hs.uu[0]).squeeze()
-        v_mag = np.sqrt(u_r**2 + u_theta**2)  # Velocity magnitude
         
-        # Also get Mach for comparison
+        # Calculate velocity magnitude (include v_phi if present)
+        if has_vphi:
+            v_phi = hs.v3p.squeeze()
+            v_mag = np.sqrt(u_r**2 + u_theta**2 + v_phi**2)
+        else:
+            v_mag = np.sqrt(u_r**2 + u_theta**2)
+        
+        # Calculate sound speed and Mach number
         P = hs.pg.squeeze()
         rho = hs.rho.squeeze()
         c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
@@ -357,12 +389,15 @@ class BondiAnalysis:
         vmax_v = np.nanpercentile(v_mag_pos, 95)
         
         im = ax.pcolormesh(x_full, z_full, v_mag_pos,
-                          vmin=vmin_v, vmax=vmax_v,
-                          cmap='plasma', alpha=0.8, shading='auto')
+                        vmin=vmin_v, vmax=vmax_v,
+                        cmap='plasma', alpha=0.8, shading='auto')
         cbar = plt.colorbar(im, ax=ax, label='Velocity Magnitude (c)', pad=0.02)
         
-        # Sonic surface (v1p = 0) - Using the PROVEN method from analyze_2d_sonic_surface!
-        # DIAGNOSTIC: Check v1p and velocity ranges
+        # SONIC SURFACE DETECTION
+        # For angular momentum: use Mach=1
+        # For pure Bondi/BHL: use v1p=0 (proven method)
+        
+        # DIAGNOSTIC: Check ranges
         v1p_min, v1p_max = np.nanmin(v1p_full), np.nanmax(v1p_full)
         v1p_near_0 = np.sum((v1p_full > -0.1) & (v1p_full < 0.1))
         v_mag_min, v_mag_max = np.nanmin(v_mag_full), np.nanmax(v_mag_full)
@@ -370,39 +405,51 @@ class BondiAnalysis:
         mach_near_1 = np.sum((mach_full > 0.9) & (mach_full < 1.1))
         
         print(f"\n=== SONIC SURFACE PLOT DIAGNOSTICS ===")
+        print(f"Scenario: {scenario}")
+        print(f"Angular momentum (v_phi): {'YES' if has_vphi else 'NO'}")
         print(f"Background: Velocity magnitude")
         print(f"  Velocity range: [{v_mag_min:.3f}, {v_mag_max:.3f}] c")
         print(f"  Mach range: [{mach_min:.3f}, {mach_max:.3f}]")
         print(f"  Points with 0.9 < Mach < 1.1: {mach_near_1}")
-        print(f"Sonic surface detection (v1p=0):")
-        print(f"  v1p range: [{v1p_min:.3f}, {v1p_max:.3f}]")
-        print(f"  Points with -0.1 < v1p < 0.1: {v1p_near_0}")
-        print(f"  v1p=0 exists: {np.any((v1p_full > -0.01) & (v1p_full < 0.01))}")
         
-        # Layer 1: Thick black base for contrast - USE v1p=0
+        if has_vphi:
+            print(f"Sonic surface detection: Mach = 1")
+            contour_field = mach_full
+            contour_level = 1.0
+            contour_label = 'SONIC (M=1)'
+        else:
+            print(f"Sonic surface detection: v1p = 0")
+            print(f"  v1p range: [{v1p_min:.3f}, {v1p_max:.3f}]")
+            print(f"  Points with -0.1 < v1p < 0.1: {v1p_near_0}")
+            print(f"  v1p=0 exists: {np.any((v1p_full > -0.01) & (v1p_full < 0.01))}")
+            contour_field = v1p_full
+            contour_level = 0.0
+            contour_label = 'SONIC'
+        
+        # Layer 1: Thick black base for contrast
         try:
-            cs_base = ax.contour(x_full, z_full, v1p_full, levels=[0.0],
-                               colors='black', linewidths=10, alpha=0.6, zorder=3)
-            print("✓ Black base contour (v1p=0) plotted successfully")
+            cs_base = ax.contour(x_full, z_full, contour_field, levels=[contour_level],
+                            colors='black', linewidths=10, alpha=0.6, zorder=3)
+            print(f"✓ Black base contour ({contour_label}) plotted successfully")
         except Exception as e:
             print(f"✗ Black contour failed: {e}")
         
-        # Layer 2: Medium red contour - USE v1p=0
+        # Layer 2: Medium red contour
         try:
-            cs_red = ax.contour(x_full, z_full, v1p_full, levels=[0.0],
-                              colors='red', linewidths=6, alpha=1.0, zorder=4)
-            print("✓ Red contour (v1p=0) plotted successfully")
+            cs_red = ax.contour(x_full, z_full, contour_field, levels=[contour_level],
+                            colors='red', linewidths=6, alpha=1.0, zorder=4)
+            print(f"✓ Red contour ({contour_label}) plotted successfully")
         except Exception as e:
             print(f"✗ Red contour failed: {e}")
         
-        # Layer 3: Thin white highlight - USE v1p=0
+        # Layer 3: Thin white highlight
         try:
-            cs_white = ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+            cs_white = ax.contour(x_full, z_full, contour_field, levels=[contour_level],
                                 colors='white', linewidths=2, alpha=0.8, zorder=5)
             # Add label
-            ax.clabel(cs_white, inline=True, fontsize=11, fmt='SONIC', 
-                     manual=[(0, np.max(z_full)*0.6)])
-            print("✓ White contour (v1p=0) plotted successfully")
+            ax.clabel(cs_white, inline=True, fontsize=11, fmt=contour_label, 
+                    manual=[(0, np.max(z_full)*0.6)])
+            print(f"✓ White contour ({contour_label}) plotted successfully")
         except Exception as e:
             print(f"✗ White contour failed: {e}")
         print("=================================\n")
@@ -412,18 +459,18 @@ class BondiAnalysis:
             # Add simple arrow showing wind direction
             arrow_props = dict(arrowstyle='->', lw=3, color='cyan', alpha=0.8)
             ax.annotate('', xy=(0, np.max(z_full)*0.75), xytext=(0, np.max(z_full)*0.95),
-                       arrowprops=arrow_props)
+                    arrowprops=arrow_props)
             ax.text(0, np.max(z_full)*0.97, 'Wind', ha='center', fontsize=10,
-                   weight='bold', color='cyan',
-                   bbox=dict(boxstyle='round', fc='black', alpha=0.7, pad=0.3))
+                weight='bold', color='cyan',
+                bbox=dict(boxstyle='round', fc='black', alpha=0.7, pad=0.3))
         
         # Add subsonic/supersonic region labels
         ax.text(0.02, 0.98, 'Subsonic\n(v < c_s)', 
-               transform=ax.transAxes, fontsize=9, va='top',
-               bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+            transform=ax.transAxes, fontsize=9, va='top',
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
         ax.text(0.98, 0.02, 'Supersonic\n(v > c_s)', 
-               transform=ax.transAxes, fontsize=9, va='bottom', ha='right',
-               bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+            transform=ax.transAxes, fontsize=9, va='bottom', ha='right',
+            bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
         
         # Horizon
         r_h = 2.0
@@ -570,6 +617,103 @@ class BondiAnalysis:
         plt.savefig(os.path.join(self.output_dir, filename), dpi=150)
         plt.close()
     
+    def plot_angular_velocity_field(self, dump_file, scenario=""):
+        """
+        Plot velocity field specifically for angular momentum scenarios.
+        Shows both radial (v_r) and azimuthal (v_phi) components.
+        """
+        self.load_data("gdump", dump_file)
+        
+        # Get velocity components
+        v_r = hs.v1p
+        
+        # Check for azimuthal velocity
+        if not (hasattr(hs, 'v3p') and hs.v3p is not None):
+            print("Warning: No azimuthal velocity found. Using regular velocity plot.")
+            return self.plot_velocity_field(dump_file, scenario)
+        
+        v_phi = hs.v3p
+        rho = hs.rho
+        
+        # Calculate total velocity magnitude
+        v_total = np.sqrt(v_r**2 + v_phi**2)
+        
+        # Coordinates
+        r = hs.r.squeeze()
+        theta = hs.h.squeeze()
+        
+        # Mirror domain
+        x_full, z_full, v_r_full = self.mirror_domain(r, theta, v_r.squeeze())
+        _, _, v_phi_full = self.mirror_domain(r, theta, v_phi.squeeze())
+        _, _, v_total_full = self.mirror_domain(r, theta, v_total.squeeze())
+        _, _, rho_full = self.mirror_domain(r, theta, rho.squeeze())
+        
+        # Create figure with 3 subplots
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Density background for all plots
+        rho_pos = rho_full.copy()
+        rho_pos[rho_pos <= 0] = np.nan
+        
+        # Plot 1: Radial velocity
+        im1 = axes[0].pcolormesh(x_full, z_full, rho_pos, norm=LogNorm(),
+                                 cmap='gray', alpha=0.3, shading='auto')
+        v_r_plot = axes[0].pcolormesh(x_full, z_full, v_r_full,
+                                      cmap='RdBu_r', alpha=0.7, shading='auto',
+                                      vmin=-np.max(np.abs(v_r_full)),
+                                      vmax=np.max(np.abs(v_r_full)))
+        axes[0].set_title('Radial Velocity (v_r)', fontsize=12, weight='bold')
+        axes[0].set_xlabel('x (r_g)')
+        axes[0].set_ylabel('z (r_g)')
+        axes[0].set_aspect('equal')
+        plt.colorbar(v_r_plot, ax=axes[0], label='v_r')
+        
+        # Add horizon
+        horizon1 = plt.Circle((0, 0), 2.0, color='black', fill=True)
+        axes[0].add_patch(horizon1)
+        
+        # Plot 2: Azimuthal velocity
+        im2 = axes[1].pcolormesh(x_full, z_full, rho_pos, norm=LogNorm(),
+                                 cmap='gray', alpha=0.3, shading='auto')
+        v_phi_plot = axes[1].pcolormesh(x_full, z_full, v_phi_full,
+                                        cmap='PRGn', alpha=0.7, shading='auto',
+                                        vmin=-np.max(np.abs(v_phi_full)),
+                                        vmax=np.max(np.abs(v_phi_full)))
+        axes[1].set_title('Azimuthal Velocity (v_φ)', fontsize=12, weight='bold')
+        axes[1].set_xlabel('x (r_g)')
+        axes[1].set_ylabel('z (r_g)')
+        axes[1].set_aspect('equal')
+        plt.colorbar(v_phi_plot, ax=axes[1], label='v_φ')
+        
+        # Add horizon
+        horizon2 = plt.Circle((0, 0), 2.0, color='black', fill=True)
+        axes[1].add_patch(horizon2)
+        
+        # Plot 3: Total velocity magnitude
+        im3 = axes[2].pcolormesh(x_full, z_full, rho_pos, norm=LogNorm(),
+                                 cmap='gray', alpha=0.3, shading='auto')
+        v_total_plot = axes[2].pcolormesh(x_full, z_full, v_total_full,
+                                          cmap='viridis', alpha=0.7, shading='auto')
+        axes[2].set_title('Total Velocity |v|', fontsize=12, weight='bold')
+        axes[2].set_xlabel('x (r_g)')
+        axes[2].set_ylabel('z (r_g)')
+        axes[2].set_aspect('equal')
+        plt.colorbar(v_total_plot, ax=axes[2], label='|v|')
+        
+        # Add horizon
+        horizon3 = plt.Circle((0, 0), 2.0, color='black', fill=True)
+        axes[2].add_patch(horizon3)
+        
+        # Super title
+        fig.suptitle(f'Angular Momentum Velocity Field (t={hs.t:.1f}) - {scenario}',
+                    fontsize=14, weight='bold')
+        
+        plt.tight_layout()
+        filename = f"angular_velocity_field_{scenario.lower().replace(' ', '_')}.png"
+        plt.savefig(os.path.join(self.output_dir, filename), dpi=150)
+        plt.close()
+        print(f"✓ Saved: {filename}")
+
     # =========================================================================
     # ANIMATIONS WITH PROPER COLOR SCALING
     # =========================================================================
@@ -694,9 +838,8 @@ class BondiAnalysis:
             ax.clear()
             self.load_data("gdump", sampled_files[frame])
             
-            # Compute fields - USE v1p for contours!
+            # Compute fields
             rho = hs.rho.squeeze()
-            v1p = hs.v1p.squeeze()  # Lab frame velocity
             v_r = (hs.uu[1] / hs.uu[0]).squeeze()
             P = hs.pg.squeeze()
             c_s = np.sqrt(GAMMA * P / (rho + P / (GAMMA - 1)))
@@ -707,7 +850,6 @@ class BondiAnalysis:
             
             # Mirror domain for full circle
             x_full, z_full, mach_full = self.mirror_domain(r, theta, mach)
-            _, _, v1p_full = self.mirror_domain(r, theta, v1p)  # For contours!
             
             # Plot Mach number with colormap
             mach_full[~np.isfinite(mach_full)] = np.nan
@@ -715,19 +857,19 @@ class BondiAnalysis:
                             vmin=vmin_mach, vmax=vmax_mach,
                             cmap='RdYlBu_r', shading='auto', alpha=0.8)
             
-            # Overlay sonic surface contour (v1p = 0) - Same method as static plots!
+            # Overlay sonic surface contour (Mach = 1) - TRIPLE LAYER!
             try:
                 # Base layer
-                ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                ax.contour(x_full, z_full, mach_full, levels=[1.0],
                         colors='black', linewidths=8, alpha=0.7, zorder=3)
                 # Main layer
-                ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                ax.contour(x_full, z_full, mach_full, levels=[1.0],
                         colors='red', linewidths=5, alpha=1.0, zorder=4)
                 # Highlight
-                ax.contour(x_full, z_full, v1p_full, levels=[0.0],
+                ax.contour(x_full, z_full, mach_full, levels=[1.0],
                         colors='white', linewidths=2, alpha=0.9, zorder=5)
             except:
-                # Silently fail if v1p=0 doesn't exist at this time
+                # Silently fail if Mach=1 doesn't exist at this time
                 pass
             
             # Add subsonic/supersonic labels
@@ -780,11 +922,11 @@ class BondiAnalysis:
         # Save with error handling
         try:
             ani.save(output_path, writer='ffmpeg', fps=fps, dpi=100)
-            print(f"\n✓ Saved: {filename}")
+            print(f"\nâœ“ Saved: {filename}")
             file_size = os.path.getsize(output_path) / (1024*1024)
             print(f"  Size: {file_size:.2f} MB, Duration: {len(sampled_files)/fps:.1f}s")
         except Exception as e:
-            print(f"\n✗ Error saving animation: {e}")
+            print(f"\nâœ— Error saving animation: {e}")
             print("  Make sure ffmpeg is installed: sudo apt-get install ffmpeg")
         finally:
             plt.close(fig)
@@ -928,10 +1070,16 @@ NOTE: The --scenario flag is ONLY for labeling plots. The actual data
         analyzer.plot_2d_sonic_evolution(sonic_results, scenario_name)
         
         # Velocity verification
-        if args.velocity_check or args.scenario in ['bhl', 'gradient', 'random']:
+        if args.velocity_check or args.scenario in ['bhl', 'gradient', 'random', 'angular']:
             print("\nVerifying velocity transformation...")
             stats = analyzer.verify_velocity_transformation(dump_files[-1])
-            analyzer.plot_velocity_field(dump_files[len(dump_files)//2], scenario_name)
+            
+            # Use angular-specific plot for angular momentum scenario
+            if args.scenario == 'angular':
+                print("Generating angular momentum velocity field plot...")
+                analyzer.plot_angular_velocity_field(dump_files[len(dump_files)//2], scenario_name)
+            else:
+                analyzer.plot_velocity_field(dump_files[len(dump_files)//2], scenario_name)
         
         # Sonic surface map
         if args.sonic_map or True:  # Always generate
@@ -949,7 +1097,7 @@ NOTE: The --scenario flag is ONLY for labeling plots. The actual data
         print(f"\n✓ 2D Analysis complete!")
         print(f"  - sonic_evolution_2d_{args.scenario}.png")
         print(f"  - sonic_map_2d_{args.scenario}.png")
-        if args.velocity_check or args.scenario in ['bhl', 'gradient', 'random']:
+        if args.velocity_check or args.scenario in ['bhl', 'gradient', 'random', 'angular']:
             print(f"  - velocity_field_{args.scenario}.png")
         if not args.no_animations:
             print(f"  - density_anim_{args.scenario}.mp4 (if ffmpeg worked)")

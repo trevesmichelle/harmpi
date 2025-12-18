@@ -648,8 +648,8 @@ void init_bondi()
 	int PURE_BONDI = 0;                    // Pure spherical Bondi accretion
 	int BONDI_HOYLE_LYTTLETON = 0;         // Uniform wind case
 	int DENSITY_GRADIENT = 0;              // Global density gradient
-	int ANGULAR_MOMENTUM = 0;              // Small initial angular momentum
-	int RANDOM_VELOCITY = 1;               // Random velocity field
+	int ANGULAR_MOMENTUM = 1;              // Small initial angular momentum
+	int RANDOM_VELOCITY = 0;               // Random velocity field
 	
 	// Wind velocity parameter - recommended values:
 	// Pure Bondi: 0.0 (no wind)

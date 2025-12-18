@@ -12,7 +12,7 @@ from matplotlib.patches import Ellipse, Rectangle
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from scipy.special import legendre 
-
+# Newest Version - Use THIS Script!
 
 class MagnetizedAnalysis:
     """Class for analyzing magnetized black hole problems"""

@@ -34,10 +34,71 @@ class TorusAnalysis:
         print(f"Loaded data from {dump_file}, time: {hs.t:.6f}")
         return hs.t
     
+    def get_torus_mask(self, rho_threshold=0.1, r_min=6, r_max=50):
+        """
+        Get mask for torus region
+        
+        Parameters:
+        -----------
+        rho_threshold : float
+            Minimum density (default 0.1, assuming rho_max normalized to 1)
+        r_min : float
+            Minimum radius (default 6 rg, inner edge of torus)
+        r_max : float
+            Maximum radius (default 50 rg, approximate outer edge)
+        
+        Returns:
+        --------
+        mask : numpy array
+            Boolean mask, True in torus region
+        """
+        rho = hs.rho.squeeze() if hasattr(hs, 'rho') else None
+        r = hs.r.squeeze() if hasattr(hs, 'r') else None
+        
+        if rho is None or r is None:
+            raise ValueError("Cannot create mask: rho or r not available")
+        
+        mask = (rho > rho_threshold) & (r > r_min) & (r < r_max)
+        
+        return mask
+
+    def get_disk_mask(self, rho_threshold=0.1, r_min=6, r_max=50, theta_width=0.3):
+        """
+        Get mask for disk midplane region
+        
+        Parameters:
+        -----------
+        rho_threshold : float
+            Minimum density
+        r_min, r_max : float
+            Radial range
+        theta_width : float
+            Angular width around equator (radians)
+        
+        Returns:
+        --------
+        mask : numpy array
+            Boolean mask, True in disk midplane
+        """
+        rho = hs.rho.squeeze() if hasattr(hs, 'rho') else None
+        r = hs.r.squeeze() if hasattr(hs, 'r') else None
+        th = hs.h.squeeze() if hasattr(hs, 'h') else None
+        
+        if rho is None or r is None or th is None:
+            raise ValueError("Cannot create mask: data not available")
+        
+        mask = (rho > rho_threshold) & \
+            (r > r_min) & (r < r_max) & \
+            (np.abs(th - np.pi/2) < theta_width)
+        
+        return mask
+
     def analyze_mri_resolution(self, dump_file="dump000"):
         """
         Analyze MRI wavelength resolution in initial conditions
         Good resolution: ≥15 cells per wavelength, acceptable: 5-10 cells
+        
+        FIXED: Only calculates in torus region, not entire domain
         """
         print("=== MRI RESOLUTION ANALYSIS ===")
         
@@ -47,42 +108,65 @@ class TorusAnalysis:
         if hasattr(hs, 'Qmri'):
             # Check resolution in theta direction (dir=2)
             Q_theta = hs.Qmri(dir=2)
-            print(f"MRI resolution in θ-direction: {Q_theta.mean():.1f} cells/wavelength")
-            print(f"Minimum resolution: {Q_theta.min():.1f} cells/wavelength")
-            print(f"Maximum resolution: {Q_theta.max():.1f} cells/wavelength")
+            
+            # CRITICAL FIX: Only average over torus region
+            rho = hs.rho.squeeze() if hasattr(hs, 'rho') else None
+            
+            if rho is not None and Q_theta is not None:
+                # Squeeze to remove singleton dimensions
+                if Q_theta.ndim == 3:
+                    Q_theta = Q_theta.squeeze()
+                
+                # Define torus mask - only where material exists
+                mask = rho > 0.1
+                
+                if mask.sum() > 0:
+                    # Calculate statistics ONLY in torus
+                    avg_resolution = Q_theta[mask].mean()
+                    min_resolution = Q_theta[mask].min()
+                    max_resolution = Q_theta[mask].max()
+                    
+                    print(f"MRI resolution in θ-direction (torus only): {avg_resolution:.1f} cells/wavelength")
+                    print(f"Minimum resolution: {min_resolution:.1f} cells/wavelength")
+                    print(f"Maximum resolution: {max_resolution:.1f} cells/wavelength")
+                    print(f"Analyzed {mask.sum()} cells in torus (out of {mask.size} total)")
+                else:
+                    print("ERROR: No torus material found (ρ > 0.1)")
+                    avg_resolution = 0
+            else:
+                print("ERROR: Could not get density or Qmri data")
+                avg_resolution = 0
             
             # Check resolution in radial direction (dir=1) if available
             try:
                 Q_radial = hs.Qmri(dir=1)
-                print(f"MRI resolution in r-direction: {Q_radial.mean():.1f} cells/wavelength")
+                if Q_radial is not None and rho is not None:
+                    if Q_radial.ndim == 3:
+                        Q_radial = Q_radial.squeeze()
+                    Q_r_avg = Q_radial[mask].mean()
+                    print(f"MRI resolution in r-direction (torus only): {Q_r_avg:.1f} cells/wavelength")
             except:
                 print("Radial MRI resolution not available")
             
             # Assessment
-            avg_resolution = Q_theta.mean()
             if avg_resolution >= 15:
                 assessment = "EXCELLENT"
-                color = "green"
             elif avg_resolution >= 10:
                 assessment = "GOOD"
-                color = "orange"
             elif avg_resolution >= 5:
                 assessment = "ACCEPTABLE"
-                color = "yellow"
             else:
                 assessment = "POOR - MRI may not develop properly"
-                color = "red"
             
             print(f"Resolution Assessment: {assessment}")
             
             return {
                 'Q_theta': Q_theta,
-                'Q_radial': Q_radial if 'Q_radial' in locals() else None,
                 'avg_resolution': avg_resolution,
                 'assessment': assessment
             }
         else:
-            print("MRI resolution function not available")
+            print("ERROR: Qmri function not available in harm_script")
             return None
     
     def analyze_time_evolution(self, dump_files, sample_every=5):
@@ -159,116 +243,196 @@ class TorusAnalysis:
     
     def calculate_alpha_parameter(self, dump_files, quasi_start_time=None, sample_every=3):
         """
-        Calculate local alpha parameter α = T^r_φ/P
-        Following Penna et al. (2013) methodology
+        Calculate alpha parameter α = T^r_φ / P
+        Attempt to separate into magnetic and Reynolds contributions
+        
+        Scientific approach: Use actual tensor components, not assumptions
         """
         print("=== ALPHA PARAMETER ANALYSIS ===")
         
         if quasi_start_time is None:
-            print("No quasi-stationary time provided, using all data")
-            quasi_files = dump_files
+            analysis_files = dump_files
         else:
-            # Filter files to quasi-stationary period
-            quasi_files = []
+            analysis_files = []
             for dump_file in dump_files:
                 try:
                     self.load_data("gdump", dump_file)
                     if hs.t >= quasi_start_time:
-                        quasi_files.append(dump_file)
+                        analysis_files.append(dump_file)
                 except:
                     continue
-            print(f"Using {len(quasi_files)} files from quasi-stationary period")
         
         # Time-averaged quantities
         alpha_total_sum = None
-        alpha_magnetic_sum = None
-        alpha_reynolds_sum = None
-        pressure_sum = None
+        alpha_mag_sum = None
+        alpha_rey_sum = None
+        beta_sum = None  # Track plasma beta
         count = 0
         
-        for dump_file in quasi_files[::sample_every]:
+        for dump_file in analysis_files[::sample_every]:
             try:
                 self.load_data("gdump", dump_file)
-                
-                # Calculate auxiliary quantities (stress tensor, etc.)
-                hs.aux()  # This computes Tud and other stress tensor components
+                hs.aux()  # Calculate derived quantities
                 
                 if not hasattr(hs, 'Tud'):
-                    print("Stress tensor not available, skipping alpha calculation")
+                    print(f"Warning: Stress tensor not available for {dump_file}")
                     continue
                 
-                # Get stress tensor components
-                T_r_phi = hs.Tud[1, 3].squeeze()  # T^r_φ component
-                
-                # Get pressure
+                # Get basic quantities
+                T_r_phi = hs.Tud[1, 3].squeeze()  # T^r_φ (TOTAL stress)
                 pg = (hs.gam - 1) * hs.ug.squeeze()  # Gas pressure
+                rho = hs.rho.squeeze()
+                r = hs.r.squeeze()
                 
-                # Calculate alpha = T^r_φ / P
-                alpha_total = T_r_phi / (pg + 1e-20)  # Add small number to avoid division by zero
+                # Torus mask
+                mask = (rho > 0.1) & (r > 6) & (r < 50)
                 
-                # Separate magnetic and Reynolds contributions
-                if hasattr(hs, 'TudEM') and hasattr(hs, 'TudMA'):
-                    T_r_phi_magnetic = hs.TudEM[1, 3].squeeze()
-                    T_r_phi_reynolds = hs.TudMA[1, 3].squeeze()
+                if mask.sum() == 0:
+                    continue
+                
+                # Total alpha (well-defined)
+                alpha_total = np.zeros_like(T_r_phi)
+                alpha_total[mask] = -T_r_phi[mask] / (pg[mask] + 1e-20)
+                
+                # Attempt to calculate magnetic vs Reynolds separation
+                can_calculate_directly = False
+                
+                if hasattr(hs, 'bcon') and hasattr(hs, 'bcov'):
+                    try:
+                        # Magnetic stress: T^r_φ_mag = -b^r b_φ
+                        b_r_con = hs.bcon[1].squeeze()
+                        b_phi_cov = hs.bcov[3].squeeze()
+                        T_mag_r_phi = -b_r_con * b_phi_cov
+                        
+                        alpha_mag = np.zeros_like(T_r_phi)
+                        alpha_mag[mask] = T_mag_r_phi[mask] / (pg[mask] + 1e-20)
+                        
+                        # Reynolds by subtraction
+                        alpha_rey = alpha_total - alpha_mag
+                        
+                        can_calculate_directly = True
+                        
+                    except Exception as e:
+                        can_calculate_directly = False
+                
+                # If direct calculation fails, use total only
+                if not can_calculate_directly:
+                    alpha_mag = np.zeros_like(alpha_total)
+                    alpha_rey = alpha_total.copy()
                     
-                    alpha_magnetic = T_r_phi_magnetic / (pg + 1e-20)
-                    alpha_reynolds = T_r_phi_reynolds / (pg + 1e-20)
-                else:
-                    # Rough estimates if separated components not available
-                    magnetic_fraction = hs.bsq.squeeze() / (hs.rho.squeeze() + hs.bsq.squeeze() + 1e-20)
-                    alpha_magnetic = alpha_total * magnetic_fraction
-                    alpha_reynolds = alpha_total * (1 - magnetic_fraction)
+                    # Calculate plasma beta for context
+                    if hasattr(hs, 'bsq'):
+                        bsq_local = hs.bsq.squeeze()
+                        beta_local = 2 * pg / (bsq_local + 1e-20)
+                    else:
+                        beta_local = np.ones_like(pg) * 1e6
                 
                 # Time averaging
                 if alpha_total_sum is None:
                     alpha_total_sum = alpha_total.copy()
-                    alpha_magnetic_sum = alpha_magnetic.copy()
-                    alpha_reynolds_sum = alpha_reynolds.copy()
-                    pressure_sum = pg.copy()
+                    alpha_mag_sum = alpha_mag.copy()
+                    alpha_rey_sum = alpha_rey.copy()
+                    if hasattr(hs, 'bsq'):
+                        beta_sum = beta_local.copy()
                 else:
                     alpha_total_sum += alpha_total
-                    alpha_magnetic_sum += alpha_magnetic
-                    alpha_reynolds_sum += alpha_reynolds
-                    pressure_sum += pg
+                    alpha_mag_sum += alpha_mag
+                    alpha_rey_sum += alpha_rey
+                    if hasattr(hs, 'bsq'):
+                        beta_sum += beta_local
                 
                 count += 1
                 
-                print(f"Processed t={hs.t:.1f} for alpha calculation")
-                
             except Exception as e:
-                print(f"Error in alpha calculation for {dump_file}: {e}")
+                print(f"Error processing {dump_file}: {e}")
                 continue
         
         if count > 0:
-            # Time-averaged alpha parameters
+            # Time averages
             alpha_total_avg = alpha_total_sum / count
-            alpha_magnetic_avg = alpha_magnetic_sum / count
-            alpha_reynolds_avg = alpha_reynolds_sum / count
-            pressure_avg = pressure_sum / count
+            alpha_mag_avg = alpha_mag_sum / count
+            alpha_rey_avg = alpha_rey_sum / count
             
+            if beta_sum is not None:
+                beta_avg = beta_sum / count
+            else:
+                beta_avg = None
+            
+            # Statistics ONLY in torus
+            mask = (rho > 0.1) & (r > 6) & (r < 50)
+            
+            # Report absolute values
+            alpha_tot_mean = np.abs(alpha_total_avg[mask]).mean()
+            alpha_mag_mean = np.abs(alpha_mag_avg[mask]).mean()
+            alpha_rey_mean = np.abs(alpha_rey_avg[mask]).mean()
+            
+            # Calculate dominance
+            if alpha_mag_mean > 1e-6:
+                total_stress = alpha_mag_mean + alpha_rey_mean
+                mag_fraction = alpha_mag_mean / (total_stress + 1e-20)
+                separation_valid = True
+            else:
+                mag_fraction = 0.0
+                separation_valid = False
+            
+            # Report results with appropriate caveats
+            print(f"\nTime-averaged alpha parameters (from {count} snapshots):")
+            print(f"  Total α = {alpha_tot_mean:.3f}")
+            
+            if separation_valid:
+                print(f"  Magnetic α = {alpha_mag_mean:.3f}")
+                print(f"  Reynolds α = {alpha_rey_mean:.3f}")
+                print(f"  Magnetic dominance: {mag_fraction*100:.1f}%")
+            else:
+                print(f"  Magnetic α = {alpha_mag_mean:.3f} (unreliable)")
+                print(f"  Reynolds α = {alpha_rey_mean:.3f} (unreliable)")
+                print(f"  WARNING: Could not reliably separate magnetic vs Reynolds stress")
+                print(f"           Report only total α = {alpha_tot_mean:.3f}")
+            
+            # Report plasma beta for physical context
+            if beta_avg is not None:
+                beta_median = np.median(beta_avg[mask])
+                beta_min = np.percentile(beta_avg[mask], 10)
+                beta_max = np.percentile(beta_avg[mask], 90)
+                
+                print(f"\n  Plasma β in torus:")
+                print(f"    Median: {beta_median:.1f}")
+                print(f"    10th-90th percentile: {beta_min:.1f} - {beta_max:.1f}")
+                
+                if beta_median > 100:
+                    print(f"  → Very weak field regime (β >> 100): Reynolds stress dominates")
+                elif beta_median > 50:
+                    print(f"  → Weak field regime (β > 50): Reynolds likely dominates")
+                elif beta_median > 10:
+                    print(f"  → Transitional regime (β ~ 10-50): Mixed stress")
+                elif beta_median > 1:
+                    print(f"  → Moderate field (β ~ 1-10): Likely mixed/magnetic dominance")
+                else:
+                    print(f"  → Strong field (β < 1): Magnetic stress should dominate")
+                        
             results = {
                 'alpha_total': alpha_total_avg,
-                'alpha_magnetic': alpha_magnetic_avg,
-                'alpha_reynolds': alpha_reynolds_avg,
-                'pressure': pressure_avg,
+                'alpha_magnetic': alpha_mag_avg,
+                'alpha_reynolds': alpha_rey_avg,
+                'separation_valid': separation_valid,
+                'beta': beta_avg if beta_avg is not None else None,
                 'count': count,
-                'r_grid': hs.r.squeeze(),
+                'mask': mask,
+                'r_grid': r,
                 'theta_grid': hs.h.squeeze()
             }
             
-            print(f"Alpha parameter calculated from {count} snapshots")
-            print(f"Typical α_total: {np.nanmean(alpha_total_avg):.3f}")
-            print(f"Typical α_magnetic: {np.nanmean(alpha_magnetic_avg):.3f}")
-            print(f"Typical α_reynolds: {np.nanmean(alpha_reynolds_avg):.3f}")
-            
             return results
         else:
-            print("No valid data for alpha calculation")
+            print("ERROR: No valid data for alpha calculation")
             return None
-    
-    def analyze_angular_velocity(self, dump_files, quasi_start_time=None, sample_every=5):
+
+    def analyze_angular_velocity(self, dump_files, quasi_start_time=None, sample_every=3):
         """
-        Analyze angular velocity Ω = u^φ/u^t and compare to Keplerian
+        Calculate angular velocity Ω = u^φ / u^t
+        Compare to Keplerian Ω_K = 1/(r^(3/2) + a)
+        
+        FIXED: Only calculates in disk midplane, not poles
         """
         print("=== ANGULAR VELOCITY ANALYSIS ===")
         
@@ -285,55 +449,85 @@ class TorusAnalysis:
                     continue
         
         omega_sum = None
-        omega_keplerian_sum = None
+        omega_K_sum = None
         count = 0
         
         for dump_file in analysis_files[::sample_every]:
             try:
                 self.load_data("gdump", dump_file)
                 
-                # Calculate Ω = u^φ/u^t
-                if hasattr(hs, 'uu'):
-                    u_phi = hs.uu[3].squeeze()
-                    u_t = hs.uu[0].squeeze()
-                    omega = u_phi / (u_t + 1e-20)
-                else:
-                    print("4-velocity not available")
+                if not hasattr(hs, 'uu'):
                     continue
                 
-                # Keplerian angular velocity: Ω_K = 1/(r^(3/2) + a)
-                r_2d = hs.r.squeeze()
-                a = hs.a  # Black hole spin
-                omega_keplerian = 1.0 / (r_2d**(1.5) + a)
+                # Angular velocity Ω = u^φ / u^t
+                omega = hs.uu[3].squeeze() / (hs.uu[0].squeeze() + 1e-20)
+                
+                # Get coordinates
+                r = hs.r.squeeze()
+                th = hs.h.squeeze()
+                rho = hs.rho.squeeze()
+                
+                # Keplerian angular velocity
+                omega_K = 1 / (r**(3/2) + hs.a)
+                
+                # CRITICAL FIX: Mask for disk midplane only
+                # Include: torus material + near equator + reasonable radii
+                mask = (rho > 0.1) & (r > 6) & (r < 50) & (np.abs(th - np.pi/2) < 0.3)
+                
+                if mask.sum() == 0:
+                    continue
+                
+                # Initialize ratio array
+                omega_ratio = np.zeros_like(omega)
+                omega_ratio[mask] = omega[mask] / (omega_K[mask] + 1e-20)
                 
                 # Time averaging
                 if omega_sum is None:
                     omega_sum = omega.copy()
-                    omega_keplerian_sum = omega_keplerian.copy()
+                    omega_K_sum = omega_K.copy()
                 else:
                     omega_sum += omega
-                    omega_keplerian_sum += omega_keplerian
+                    omega_K_sum += omega_K
                 
                 count += 1
                 
             except Exception as e:
-                print(f"Error in omega calculation for {dump_file}: {e}")
+                print(f"Error in angular velocity calculation: {e}")
                 continue
         
         if count > 0:
             omega_avg = omega_sum / count
-            omega_keplerian_avg = omega_keplerian_sum / count
+            omega_K_avg = omega_K_sum / count
+            
+            # Calculate ratio ONLY in disk
+            mask = (rho > 0.1) & (r > 6) & (r < 50) & (np.abs(th - np.pi/2) < 0.3)
+            
+            omega_ratio = np.zeros_like(omega_avg)
+            omega_ratio[mask] = omega_avg[mask] / (omega_K_avg[mask] + 1e-20)
+            
+            ratio_mean = omega_ratio[mask].mean()
+            
+            print(f"\nAngular velocity analysis (from {count} snapshots):")
+            print(f"  Ω/Ω_Keplerian = {ratio_mean:.2f}")
+            print(f"  Analyzed {mask.sum()} cells in disk midplane")
+            
+            if ratio_mean < 0.8:
+                print("  → Sub-Keplerian rotation (expected for accretion disk)")
+            elif ratio_mean > 1.2:
+                print("  → Super-Keplerian rotation (unusual - check mask)")
+            else:
+                print("  → Near-Keplerian rotation")
             
             results = {
                 'omega': omega_avg,
-                'omega_keplerian': omega_keplerian_avg,
-                'omega_ratio': omega_avg / (omega_keplerian_avg + 1e-20),
-                'r_grid': hs.r.squeeze(),
-                'theta_grid': hs.h.squeeze(),
-                'count': count
+                'omega_keplerian': omega_K_avg,
+                'omega_K': omega_K_avg,
+                'omega_ratio': omega_ratio,
+                'count': count,
+                'mask': mask,
+                'r_grid': r,
+                'theta_grid': th
             }
-            
-            print(f"Angular velocity analyzed from {count} snapshots")
             
             return results
         else:
@@ -642,18 +836,30 @@ class TorusAnalysis:
             summary_text += f"MRI Resolution: {mri_results['avg_resolution']:.1f} cells/wavelength ({mri_results['assessment']})\n"
         
         if alpha_results:
-            alpha_mean = np.nanmean(alpha_results['alpha_total'])
-            alpha_mag_mean = np.nanmean(alpha_results['alpha_magnetic'])
-            alpha_rey_mean = np.nanmean(alpha_results['alpha_reynolds'])
+            # FIXED: Use masked values, not entire array
+            if 'mask' in alpha_results:
+                mask = alpha_results['mask']
+                alpha_mean = np.abs(alpha_results['alpha_total'][mask]).mean()
+                alpha_mag = np.abs(alpha_results['alpha_magnetic'][mask]).mean()
+                alpha_rey = np.abs(alpha_results['alpha_reynolds'][mask]).mean()
+            else:
+                alpha_mean = np.nanmean(np.abs(alpha_results['alpha_total']))
+                alpha_mag = np.nanmean(np.abs(alpha_results['alpha_magnetic']))
+                alpha_rey = np.nanmean(np.abs(alpha_results['alpha_reynolds']))
             summary_text += f"Alpha Parameter: α_total = {alpha_mean:.3f}\n"
-            summary_text += f"  α_magnetic = {alpha_mag_mean:.3f}\n"
-            summary_text += f"  α_reynolds = {alpha_rey_mean:.3f}\n"
+            summary_text += f"  α_magnetic = {alpha_mag:.3f}\n"
+            summary_text += f"  α_reynolds = {alpha_rey:.3f}\n"
         
         if evolution_results and evolution_results['quasi_stationary_start']:
             summary_text += f"Quasi-stationary regime starts: t ≈ {evolution_results['quasi_stationary_start']:.1f}\n"
         
         if omega_results:
-            omega_ratio_mean = np.nanmean(omega_results['omega_ratio'])
+        # Use masked values
+            if 'mask' in omega_results:
+                mask = omega_results['mask']
+                omega_ratio_mean = omega_results['omega_ratio'][mask].mean()
+            else:
+                omega_ratio_mean = np.nanmean(omega_results['omega_ratio'])
             summary_text += f"Ω/Ω_K ratio: {omega_ratio_mean:.2f}\n"
         
         summary_text += f"\nPhysical Interpretation:\n"
@@ -675,11 +881,13 @@ class TorusAnalysis:
             plt.show()
         else:
             plt.close()
-    
+
     def analyze_vertical_alpha(self, dump_files, quasi_start_time=None, sample_every=3):
         """
-        Calculate vertical alpha parameter α_z = T^z_φ/P
+        Calculate vertical alpha parameter α_z = T^θ_φ/P
         Compare with radial α_r for stress anisotropy
+        
+        FIXED: Only calculates in torus region
         """
         print("=== VERTICAL ALPHA PARAMETER ANALYSIS ===")
         
@@ -713,10 +921,22 @@ class TorusAnalysis:
                 
                 # Pressure
                 pg = (hs.gam - 1) * hs.ug.squeeze()
+                rho = hs.rho.squeeze()
+                r = hs.r.squeeze()
                 
-                # Alpha parameters
-                alpha_z = T_z_phi / (pg + 1e-20)
-                alpha_r = T_r_phi / (pg + 1e-20)
+                # CRITICAL FIX: Torus mask
+                mask = (rho > 0.1) & (r > 6) & (r < 50)
+                
+                if mask.sum() == 0:
+                    continue
+                
+                # Initialize alpha arrays
+                alpha_z = np.zeros_like(T_z_phi)
+                alpha_r = np.zeros_like(T_r_phi)
+                
+                # Calculate ONLY in torus
+                alpha_z[mask] = -T_z_phi[mask] / (pg[mask] + 1e-20)
+                alpha_r[mask] = -T_r_phi[mask] / (pg[mask] + 1e-20)
                 
                 # Time averaging
                 if alpha_z_sum is None:
@@ -736,17 +956,26 @@ class TorusAnalysis:
             alpha_z_avg = alpha_z_sum / count
             alpha_r_avg = alpha_r_sum / count
             
+            # Get mask for final statistics
+            mask = (rho > 0.1) & (r > 6) & (r < 50)
+            
+            # Calculate averages ONLY in torus
+            alpha_z_mean = alpha_z_avg[mask].mean()
+            alpha_r_mean = alpha_r_avg[mask].mean()
+            anisotropy = alpha_z_mean / (alpha_r_mean + 1e-20)
+            
+            print(f"\nVertical alpha calculated from {count} snapshots:")
+            print(f"  α_z (vertical) = {alpha_z_mean:.3f}")
+            print(f"  α_r (radial) = {alpha_r_mean:.3f}")
+            print(f"  Anisotropy α_z/α_r = {anisotropy:.2f}")
+            
             results = {
                 'alpha_z': alpha_z_avg,
                 'alpha_r': alpha_r_avg,
                 'alpha_ratio': alpha_z_avg / (alpha_r_avg + 1e-20),
-                'count': count
+                'count': count,
+                'mask': mask
             }
-            
-            print(f"Vertical alpha calculated from {count} snapshots")
-            print(f"Typical α_z: {np.nanmean(alpha_z_avg):.3f}")
-            print(f"Typical α_r: {np.nanmean(alpha_r_avg):.3f}")
-            print(f"Typical α_z/α_r: {np.nanmean(results['alpha_ratio']):.3f}")
             
             return results
         else:
@@ -947,9 +1176,16 @@ def main():
         print(f"Assessment: {mri_results['assessment']}")
     
     if alpha_results:
-        alpha_mean = np.nanmean(alpha_results['alpha_total'])
-        alpha_mag = np.nanmean(alpha_results['alpha_magnetic'])
-        alpha_rey = np.nanmean(alpha_results['alpha_reynolds'])
+        # FIXED: Use masked values, not entire array
+        if 'mask' in alpha_results:
+            mask = alpha_results['mask']
+            alpha_mean = np.abs(alpha_results['alpha_total'][mask]).mean()
+            alpha_mag = np.abs(alpha_results['alpha_magnetic'][mask]).mean()
+            alpha_rey = np.abs(alpha_results['alpha_reynolds'][mask]).mean()
+        else:
+            alpha_mean = np.nanmean(np.abs(alpha_results['alpha_total']))
+            alpha_mag = np.nanmean(np.abs(alpha_results['alpha_magnetic']))
+            alpha_rey = np.nanmean(np.abs(alpha_results['alpha_reynolds']))
         print(f"\nAlpha Parameters:")
         print(f"  Total α = {alpha_mean:.3f}")
         print(f"  Magnetic α = {alpha_mag:.3f}")
@@ -957,15 +1193,26 @@ def main():
         print(f"  Magnetic dominance: {alpha_mag/(alpha_mag+alpha_rey)*100:.1f}%")
     
     if vertical_alpha_results:
-        alpha_z_mean = np.nanmean(vertical_alpha_results['alpha_z'])
-        alpha_r_mean = np.nanmean(vertical_alpha_results['alpha_r'])
+        # FIXED: Use masked values
+        if 'mask' in vertical_alpha_results:
+            mask = vertical_alpha_results['mask']
+            alpha_z_mean = vertical_alpha_results['alpha_z'][mask].mean()
+            alpha_r_mean = vertical_alpha_results['alpha_r'][mask].mean()
+        else:
+            alpha_z_mean = np.nanmean(vertical_alpha_results['alpha_z'])
+            alpha_r_mean = np.nanmean(vertical_alpha_results['alpha_r'])
         print(f"\nVertical vs Radial Stress:")
         print(f"  α_z (vertical) = {alpha_z_mean:.3f}")
         print(f"  α_r (radial) = {alpha_r_mean:.3f}")
         print(f"  Anisotropy α_z/α_r = {alpha_z_mean/alpha_r_mean:.2f}")
     
     if omega_results:
-        omega_ratio = np.nanmean(omega_results['omega_ratio'])
+        # FIXED: Use masked values
+        if 'mask' in omega_results:
+            mask = omega_results['mask']
+            omega_ratio = omega_results['omega_ratio'][mask].mean()
+        else:
+            omega_ratio = np.nanmean(omega_results['omega_ratio'])
         print(f"\nAngular Velocity:")
         print(f"  Ω/Ω_Keplerian = {omega_ratio:.2f}")
         if omega_ratio < 0.8:

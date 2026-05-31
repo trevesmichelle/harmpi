@@ -386,6 +386,12 @@ def rg2(dump):
 
 #high-level function that reads either MPI or serial gdump's
 def read_file(dump,type=None,savedump=True,saverdump=False,noround=False):
+    # Accept 'dump005', 'dumps/dump005', or integer 5 — strip leading "dumps/" so
+    # subsequent "dumps/" + dump concatenations resolve to a single prefix.
+    if isinstance(dump, int):
+        dump = "dump%03d" % dump
+    if dump.startswith("dumps/"):
+        dump = dump[len("dumps/"):]
     if type is None:
         if dump.startswith("dump"):
             type = "dump"

@@ -5,6 +5,8 @@ Based on SOMA2017 exercises - analyzing MRI, accretion, and magnetized dynamics
 """
 
 import harm_script as hs
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np
@@ -159,7 +161,10 @@ class TorusAnalysis:
                 assessment = "POOR - MRI may not develop properly"
             
             print(f"Resolution Assessment: {assessment}")
-            
+
+            # Plot Q_theta spatial map + histogram (so we see WHERE MRI is resolved)
+            self._plot_mri_resolution(Q_theta, rho, mask, dump_file)
+
             return {
                 'Q_theta': Q_theta,
                 'avg_resolution': avg_resolution,
@@ -168,7 +173,51 @@ class TorusAnalysis:
         else:
             print("ERROR: Qmri function not available in harm_script")
             return None
-    
+    def _plot_mri_resolution(self, Q_theta, rho, mask, dump_file):
+        """Save 2D map + histogram of Q_theta inside torus mask."""
+        r = hs.r.squeeze()
+        z = hs.r.squeeze() * np.cos(hs.h.squeeze())
+        R = hs.r.squeeze() * np.sin(hs.h.squeeze())
+
+        # Mask out non-torus cells so colormap focuses on the disk
+        Q_masked = np.where(mask, Q_theta, np.nan)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        # Left: 2D spatial map of Q_theta in poloidal plane
+        im = axes[0].pcolormesh(R, z, Q_masked, cmap="viridis",
+                                vmin=0, vmax=20, shading="auto")
+        axes[0].set_xlabel("R [r_g]")
+        axes[0].set_ylabel("z [r_g]")
+        axes[0].set_title(f"Q_theta map (torus cells only), {dump_file}")
+        axes[0].set_xlim(0, 80)
+        axes[0].set_ylim(-40, 40)
+        axes[0].set_aspect("equal")
+        cbar = fig.colorbar(im, ax=axes[0])
+        cbar.set_label("Q_theta [cells per MRI wavelength]")
+        # Reference lines for resolution thresholds
+        for val, lbl in [(6, "Q=6"), (10, "Q=10")]:
+            cbar.ax.axhline(val, color="red", lw=0.8, ls="--")
+
+        # Right: histogram of Q_theta inside torus
+        Q_inside = Q_theta[mask]
+        Q_inside = Q_inside[np.isfinite(Q_inside)]
+        axes[1].hist(Q_inside, bins=60, range=(0, 30), color="steelblue", edgecolor="k")
+        axes[1].axvline(6,  color="orange", ls="--", lw=1.5, label="Q=6 (marginal)")
+        axes[1].axvline(10, color="green",  ls="--", lw=1.5, label="Q=10 (good)")
+        axes[1].axvline(np.median(Q_inside), color="red", ls="-", lw=2,
+                        label=f"median = {np.median(Q_inside):.1f}")
+        axes[1].set_xlabel("Q_theta")
+        axes[1].set_ylabel("number of cells")
+        axes[1].set_title("Distribution of MRI resolution inside torus")
+        axes[1].legend()
+
+        plt.tight_layout()
+        out = f"{self.output_dir}/mri_resolution_{dump_file}.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved {out}")
+
     def analyze_time_evolution(self, dump_files, sample_every=5):
         """Analyze time evolution to identify quasi-stationary regime"""
         print("=== TIME EVOLUTION ANALYSIS ===")

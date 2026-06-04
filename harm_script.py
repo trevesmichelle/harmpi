@@ -336,7 +336,7 @@ def Qmri(dir=2):
     """
     APPROXIMATELY Computes number of theta cells resolving one MRI wavelength
     """
-    global bu,rho,uu,_dx2,_dx3
+    global bu,rho,uu,_dx1,_dx2,_dx3
     #cvel()
     #corrected this expression to include both 2pi and dxdxp[3][3]
     #also corrected defition of va^2 to contain bsq+gam*ug term
@@ -344,7 +344,9 @@ def Qmri(dir=2):
     vaudir = np.abs(bu[dir])/np.sqrt(rho+bsq+gam*ug)
     omega = dxdxp[3][3]*uu[3]/uu[0]+1e-15
     lambdamriudir = 2*np.pi * vaudir / omega
-    if dir == 2:
+    if dir == 1:
+        res=lambdamriudir/_dx1
+    elif dir == 2:
         res=lambdamriudir/_dx2
     elif dir == 3:
         res=lambdamriudir/_dx3

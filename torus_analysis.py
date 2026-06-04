@@ -147,7 +147,7 @@ class TorusAnalysis:
                         Q_radial = Q_radial.squeeze()
                     Q_r_avg = Q_radial[mask].mean()
                     print(f"MRI resolution in r-direction (torus only): {Q_r_avg:.1f} cells/wavelength")
-            except:
+            except Exception as e:
                 print("Radial MRI resolution not available")
             
             # Assessment

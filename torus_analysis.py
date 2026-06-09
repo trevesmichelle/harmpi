@@ -15,6 +15,7 @@ import argparse
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.gridspec import GridSpec
 import glob
+import re
 
 
 class TorusAnalysis:
@@ -224,10 +225,12 @@ class TorusAnalysis:
         
         results = {
             'times': [],
-            'mdot_inner': [],  # Mass accretion rate near inner edge
-            'magnetic_energy': [],
-            'kinetic_energy': [],
-            'density_center': [],  # Density in central region
+            'mdot': [],               # flux-integrated mdot at 2*r_horizon (positive=inflow)
+            'r_measure': None,        # radius where mdot measured (set once below)
+            'spin': None,             # black hole spin a, for reproducibility
+            'bsq_mean': [],           # mean b^2 (magnetic field strength proxy, NOT energy density)
+            'u0_mean': [],            # mean u^0 / Lorentz factor proxy (NOT kinetic energy)
+            'density_center': [],     # mean rho over inner third in radius
             'quasi_stationary_start': None
         }
         
@@ -239,34 +242,38 @@ class TorusAnalysis:
                 r_2d = hs.r.squeeze()
                 rho_2d = hs.rho.squeeze()
                 
-                # Mass accretion rate estimation (simplified)
-                # Look at density in inner region (r < 10)
-                inner_mask = r_2d < 10
-                mdot_proxy = np.mean(rho_2d[inner_mask]) if np.any(inner_mask) else 0
+                # Flux-integrated mdot at 2*r_horizon: -∮ rho u^r sqrt(-g) dx2 dx3.
+                # Positive = inflow. r_horizon from hs.rhor, so this tracks spin automatically.
+                r_measure = 2.0 * hs.rhor
+                i_mdot = hs.iofr(r_measure)
+                mdot = -np.sum(hs.rho[i_mdot,:,:] * hs.uu[1][i_mdot,:,:]
+                               * hs.gdet[i_mdot,:,:]) * hs._dx2 * hs._dx3
                 
-                # Magnetic energy
+                # mean b^2 -- proxy for magnetic field strength, not volume-weighted energy
                 if hasattr(hs, 'bsq'):
-                    magnetic_energy = np.mean(hs.bsq.squeeze())
+                    bsq_mean = np.mean(hs.bsq.squeeze())
                 else:
-                    magnetic_energy = 0
+                    bsq_mean = 0
                 
-                # Kinetic energy (rough estimate)
+                # mean u^0 (Lorentz factor proxy), not kinetic energy
                 if hasattr(hs, 'uu'):
-                    kinetic_energy = np.mean(hs.uu[0].squeeze())
+                    u0_mean = np.mean(hs.uu[0].squeeze())
                 else:
-                    kinetic_energy = 0
+                    u0_mean = 0
                 
                 # Central density (as indicator of torus evolution)
                 center_idx = len(r_2d) // 3  # Inner third of domain
                 density_center = np.mean(rho_2d[:center_idx, :])
                 
                 results['times'].append(current_time)
-                results['mdot_inner'].append(mdot_proxy)
-                results['magnetic_energy'].append(magnetic_energy)
-                results['kinetic_energy'].append(kinetic_energy)
+                results['mdot'].append(mdot)
+                results['r_measure'] = float(r_measure)
+                results['spin'] = float(hs.a)
+                results['bsq_mean'].append(bsq_mean)
+                results['u0_mean'].append(u0_mean)
                 results['density_center'].append(density_center)
                 
-                print(f"t={current_time:.1f}: ρ_center={density_center:.3e}, B²={magnetic_energy:.3e}")
+                print(f"t={current_time:.1f}: ρ_center={density_center:.3e}, B²={bsq_mean:.3e}")
                 
             except Exception as e:
                 print(f"Error processing {dump_file}: {e}")
@@ -275,12 +282,12 @@ class TorusAnalysis:
         # Identify quasi-stationary regime
         if len(results['times']) > 10:
             # Look for when magnetic energy stabilizes
-            mag_energy = np.array(results['magnetic_energy'])
+            mag_proxy = np.array(results['bsq_mean'])
             times = np.array(results['times'])
             
             # Simple criterion: when magnetic energy stops growing rapidly
-            if len(mag_energy) > 20:
-                growth_rate = np.gradient(mag_energy, times)
+            if len(mag_proxy) > 20:
+                growth_rate = np.gradient(mag_proxy, times)
                 # Find when growth rate becomes small
                 stable_indices = np.where(np.abs(growth_rate) < 0.1 * np.max(np.abs(growth_rate)))[0]
                 if len(stable_indices) > 0:
@@ -730,16 +737,16 @@ class TorusAnalysis:
         ax1 = fig.add_subplot(gs[0, 0])
         if evolution_results and evolution_results['times']:
             times = evolution_results['times']
-            ax1.semilogy(times, evolution_results['magnetic_energy'], 'r-', linewidth=2, label='Magnetic')
-            ax1.semilogy(times, evolution_results['kinetic_energy'], 'b-', linewidth=2, label='Kinetic')
+            ax1.semilogy(times, evolution_results['bsq_mean'], 'r-', linewidth=2, label=r'$\langle b^2 \rangle$ (field strength proxy)')
+            ax1.semilogy(times, evolution_results['u0_mean'], 'b-', linewidth=2, label=r'$\langle u^0 \rangle$ (Lorentz factor proxy)')
             
             if evolution_results['quasi_stationary_start']:
                 ax1.axvline(evolution_results['quasi_stationary_start'], 
                            color='green', linestyle='--', alpha=0.7, label='Quasi-stationary')
             
-            ax1.set_xlabel('Time')
-            ax1.set_ylabel('Energy')
-            ax1.set_title('Energy Evolution')
+            ax1.set_xlabel('Time [M]')
+            ax1.set_ylabel('proxy value (code units)')
+            ax1.set_title('Field & flow proxies vs time')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
         
@@ -765,7 +772,7 @@ class TorusAnalysis:
                 
                 ax2.set_xlabel('Radius')
                 ax2.set_ylabel('Cells per MRI wavelength')
-                ax2.set_title(f'MRI Resolution ({mri_results["assessment"]})')
+                ax2.set_title(f'MRI resolution vs radius (assessment: {mri_results["assessment"]})')
                 ax2.legend()
                 ax2.grid(True, alpha=0.3)
         
@@ -793,10 +800,10 @@ class TorusAnalysis:
         # 4. Mass accretion rate evolution
         ax4 = fig.add_subplot(gs[1, 0])
         if evolution_results and evolution_results['times']:
-            ax4.plot(evolution_results['times'], evolution_results['mdot_inner'], 'purple', linewidth=2)
-            ax4.set_xlabel('Time')
-            ax4.set_ylabel('Mass Accretion Rate (proxy)')
-            ax4.set_title('Accretion Rate Evolution')
+            ax4.plot(evolution_results['times'], evolution_results['mdot'], 'purple', linewidth=2)
+            ax4.set_xlabel('Time [M]')
+            ax4.set_ylabel(r'$\dot{M}$ at $2r_+$ (code units)')
+            ax4.set_title('Accretion rate vs time')
             ax4.grid(True, alpha=0.3)
         
         # 5. Alpha components comparison
@@ -911,11 +918,11 @@ class TorusAnalysis:
                 omega_ratio_mean = np.nanmean(omega_results['omega_ratio'])
             summary_text += f"Ω/Ω_K ratio: {omega_ratio_mean:.2f}\n"
         
-        summary_text += f"\nPhysical Interpretation:\n"
-        summary_text += f"• MRI drives turbulent accretion\n"
-        summary_text += f"• Alpha parameter quantifies viscosity\n"
-        summary_text += f"• Magnetic stresses dominate transport\n"
-        summary_text += f"• Angular momentum redistribution occurs"
+        summary_text += f"\nNotes:\n"
+        summary_text += f"• b^2, u^0, rho values are proxies (not volume-weighted)\n"
+        summary_text += f"• alpha from masked torus cells\n"
+        summary_text += f"• mdot proxy = mean rho at r<10, not flux-integrated\n"
+        summary_text += f"• quasi-stationary start is heuristic"
         
         ax8.text(0.05, 0.95, summary_text, transform=ax8.transAxes, 
                 fontsize=11, verticalalignment='top', fontfamily='monospace',
@@ -1116,10 +1123,11 @@ class TorusAnalysis:
         plt.close(fig)
 
 
-def get_dump_files(dump_folder="dumps", pattern="dump[0-9][0-9][0-9]"):
-    """Get sorted list of dump files"""
-    dump_files = sorted(glob.glob(os.path.join(dump_folder, pattern)))
+def get_dump_files(dump_folder="dumps", pattern="dump[0-9][0-9][0-9]*"):
+    """Get sorted list of dump files, ordered by numeric index."""
+    dump_files = glob.glob(os.path.join(dump_folder, pattern))
     dump_files = [os.path.basename(f) for f in dump_files]
+    dump_files.sort(key=lambda f: int(re.sub(r'\D', '', f)))
     return dump_files
 
 

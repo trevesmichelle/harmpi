@@ -228,7 +228,7 @@ class TorusAnalysis:
             'mdot': [],               # flux-integrated mdot at 2*r_horizon (positive=inflow)
             'r_measure': None,        # radius where mdot measured (set once below)
             'spin': None,             # black hole spin a, for reproducibility
-            'bsq_mean': [],           # mean b^2 (magnetic field strength proxy, NOT energy density)
+            'E_mag': [],              # volume-weighted magnetic energy in torus (rho>0.1)
             'u0_mean': [],            # mean u^0 / Lorentz factor proxy (NOT kinetic energy)
             'density_center': [],     # mean rho over inner third in radius
             'quasi_stationary_start': None
@@ -249,11 +249,15 @@ class TorusAnalysis:
                 mdot = -np.sum(hs.rho[i_mdot,:,:] * hs.uu[1][i_mdot,:,:]
                                * hs.gdet[i_mdot,:,:]) * hs._dx2 * hs._dx3
                 
-                # mean b^2 -- proxy for magnetic field strength, not volume-weighted energy
+                # Volume-weighted magnetic energy in torus: ∫ (b^2/2) sqrt(-g) dx1 dx2 dx3
+                # over rho>0.1 cells. Real energy, not an unweighted mean.
                 if hasattr(hs, 'bsq'):
-                    bsq_mean = np.mean(hs.bsq.squeeze())
+                    dV = hs.gdet.squeeze() * hs._dx1 * hs._dx2 * hs._dx3
+                    bsq_sq = hs.bsq.squeeze()
+                    tor = rho_2d > 0.1
+                    E_mag = np.sum(0.5 * bsq_sq[tor] * dV[tor])
                 else:
-                    bsq_mean = 0
+                    E_mag = 0
                 
                 # mean u^0 (Lorentz factor proxy), not kinetic energy
                 if hasattr(hs, 'uu'):
@@ -269,11 +273,11 @@ class TorusAnalysis:
                 results['mdot'].append(mdot)
                 results['r_measure'] = float(r_measure)
                 results['spin'] = float(hs.a)
-                results['bsq_mean'].append(bsq_mean)
+                results['E_mag'].append(E_mag)
                 results['u0_mean'].append(u0_mean)
                 results['density_center'].append(density_center)
                 
-                print(f"t={current_time:.1f}: ρ_center={density_center:.3e}, B²={bsq_mean:.3e}")
+                print(f"t={current_time:.1f}: ρ_center={density_center:.3e}, E_mag={E_mag:.3e}") # before: B²={bsq_mean:.3e}
                 
             except Exception as e:
                 print(f"Error processing {dump_file}: {e}")
@@ -282,7 +286,7 @@ class TorusAnalysis:
         # Identify quasi-stationary regime
         if len(results['times']) > 10:
             # Look for when magnetic energy stabilizes
-            mag_proxy = np.array(results['bsq_mean'])
+            mag_proxy = np.array(results['E_mag'])
             times = np.array(results['times'])
             
             # Simple criterion: when magnetic energy stops growing rapidly
@@ -737,7 +741,7 @@ class TorusAnalysis:
         ax1 = fig.add_subplot(gs[0, 0])
         if evolution_results and evolution_results['times']:
             times = evolution_results['times']
-            ax1.semilogy(times, evolution_results['bsq_mean'], 'r-', linewidth=2, label=r'$\langle b^2 \rangle$ (field strength proxy)')
+            ax1.semilogy(times, evolution_results['E_mag'], 'r-', linewidth=2, label=r'$E_{\rm mag}$ (torus, code units)')
             ax1.semilogy(times, evolution_results['u0_mean'], 'b-', linewidth=2, label=r'$\langle u^0 \rangle$ (Lorentz factor proxy)')
             
             if evolution_results['quasi_stationary_start']:
@@ -759,7 +763,13 @@ class TorusAnalysis:
             if r_2d is not None and Q_theta is not None:
                 # Plot resolution vs radius (averaged over theta)
                 if Q_theta.ndim > 1:
-                    Q_avg = Q_theta.mean(axis=1)
+                    # Mask to torus cells (rho>0.1) and exclude pathological Q spikes
+                    # (omega->0 cells produce Q up to ~1e5). Average over valid cells per radius.
+                    rho_2d = hs.rho.squeeze()
+                    valid = (rho_2d > 0.1) & (Q_theta < 100) & np.isfinite(Q_theta)
+                    Q_masked = np.where(valid, Q_theta, np.nan)
+                    with np.errstate(invalid='ignore'):
+                        Q_avg = np.nanmean(Q_masked, axis=1)
                     r_1d = r_2d[:, 0] if r_2d.ndim > 1 else r_2d
                 else:
                     Q_avg = Q_theta

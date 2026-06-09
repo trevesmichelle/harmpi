@@ -152,8 +152,8 @@ void init_torus()
 
   /* disk parameters (use fishbone.m to select new solutions) */
   a = 0.9 ;
-  rin = 6. ;
-  rmax = 13. ;
+  rin = 15. ;  // was 6.  — Chashkina 2021 fiducial
+  rmax = 32. ;  // was 13. — Chashkina 2021 fiducial
   l = lfish_calc(rmax) ;
 
   kappa =1.e-3;
@@ -210,7 +210,7 @@ void init_torus()
   }
 
   /* output choices */
-  tf = 500.0 ; //originally 10000.0 --> then 1000.0
+  tf = 10000.0 ; //originally 10000.0 --> then 1000.0
 
   DTd = 5.; /* dumping frequency, in units of M  (originally 10.) */
   DTl = 5. ;	/* logfile frequency, in units of M (originally 10.) */

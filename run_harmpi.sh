@@ -1,8 +1,8 @@
 #!/bin/bash
 
-#PBS -l nodes=1:ppn=1
+#PBS -l nodes=1:ppn=64
 #PBS -m abe
-#PBS -N harmpi_Michelle_test
+#PBS -N torus_512_64c
 
 hostname
 
@@ -16,4 +16,4 @@ echo PBS: job identifier is $PBS_JOBID
 echo PBS: job name is $PBS_JOBNAME
 echo ------------------------------------------------------
 
-mpirun -np 1 ./harm 1 1 1 2>err 1>out
+mpirun -np 64 ./harm 8 8 1 2>err 1>out

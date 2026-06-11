@@ -7,6 +7,7 @@ Based on SOMA2017 exercises - analyzing MRI, accretion, and magnetized dynamics
 import harm_script as hs
 import matplotlib
 matplotlib.use("Agg")
+matplotlib.rcParams['savefig.facecolor'] = 'white'   # inline backend sets transparent figs; force opaque saves
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np

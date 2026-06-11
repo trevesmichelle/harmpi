@@ -300,8 +300,76 @@ class TorusAnalysis:
                     results['quasi_stationary_start'] = times[quasi_start_idx]
                     print(f"Quasi-stationary regime estimated to start at t ≈ {results['quasi_stationary_start']:.1f}")
         
+        self._plot_time_evolution(results)
+        
         return results
     
+    def _plot_time_evolution(self, results):
+        """Save canonical time-evolution figure: E_mag(t), mdot(t), rho_center(t).
+
+        Plateau statistics are computed over t > quasi_stationary_start when
+        available, else over the last half of the run.
+        """
+        times = np.array(results['times'])
+        if times.size == 0:
+            print("No time-evolution data to plot; skipping figure.")
+            return
+        E_mag = np.array(results['E_mag'])
+        mdot = np.array(results['mdot'])
+        rho_c = np.array(results['density_center'])
+
+        t_qs = results['quasi_stationary_start']
+        t_plateau = t_qs if t_qs is not None else 0.5 * times.max()
+        plateau = times > t_plateau
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Left: volume-weighted magnetic energy (torus, rho>0.1), log scale
+        axes[0].plot(times, E_mag, color="navy", lw=1.5)
+        axes[0].set_yscale("log")
+        axes[0].set_xlabel("t [r_g/c]")
+        axes[0].set_ylabel("E_mag = ∫ (b²/2) √(-g) dV  (torus, ρ>0.1)")
+        axes[0].set_title("Magnetic energy: MRI growth and saturation")
+        if plateau.sum() > 1:
+            m, s = E_mag[plateau].mean(), E_mag[plateau].std()
+            axes[0].axhspan(m - s, m + s, color="navy", alpha=0.15)
+            axes[0].axhline(m, color="navy", ls="--", lw=1,
+                            label=f"plateau mean = {m:.1f} ± {s:.2f}")
+            axes[0].legend()
+
+        # Middle: flux-integrated mdot at r_measure (positive = inflow)
+        axes[1].plot(times, mdot, color="darkgreen", lw=1.2)
+        axes[1].axhline(0, color="gray", lw=0.8)
+        axes[1].set_xlabel("t [r_g/c]")
+        axes[1].set_ylabel("mdot = -∮ ρ uʳ √(-g) dx² dx³")
+        axes[1].set_title(f"Accretion rate at r = {results['r_measure']:.2f} r_g "
+                          f"(2 r_horizon, a = {results['spin']:.2f})")
+        if plateau.sum() > 1:
+            m, s = mdot[plateau].mean(), mdot[plateau].std()
+            axes[1].axhspan(m - s, m + s, color="darkgreen", alpha=0.15)
+            axes[1].axhline(m, color="darkgreen", ls="--", lw=1,
+                            label=f"plateau mean = {m:.3f} ± {s:.3f}")
+            axes[1].legend()
+
+        # Right: mean density over inner third in radius (inward mass transport)
+        axes[2].plot(times, rho_c, color="maroon", lw=1.5)
+        axes[2].set_xlabel("t [r_g/c]")
+        axes[2].set_ylabel("⟨ρ⟩, inner third in radius")
+        axes[2].set_title("Inner-region density: inward mass transport")
+
+        # Mark quasi-stationary start on all panels
+        if t_qs is not None:
+            for ax in axes:
+                ax.axvline(t_qs, color="black", ls=":", lw=1.2)
+            axes[0].text(t_qs, axes[0].get_ylim()[1], f" t_qs ≈ {t_qs:.0f}",
+                         va="top", fontsize=10)
+
+        plt.tight_layout()
+        out = f"{self.output_dir}/time_evolution.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved {out}")
+        
     def calculate_alpha_parameter(self, dump_files, quasi_start_time=None, sample_every=3):
         """
         Calculate alpha parameter α = T^r_φ / P

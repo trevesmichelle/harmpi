@@ -341,7 +341,7 @@ class TorusAnalysis:
         axes[1].plot(times, mdot, color="darkgreen", lw=1.2)
         axes[1].axhline(0, color="gray", lw=0.8)
         axes[1].set_xlabel("t [r_g/c]")
-        axes[1].set_ylabel("mdot = -∮ ρ uʳ √(-g) dx² dx³")
+        axes[1].set_ylabel(r"$\dot{M} = -\oint \rho\, u^{r}\, \sqrt{-g}\, dx^{2}\, dx^{3}$") # originally literal "mdot = -∮ ρ uʳ √(-g) dx² dx³"
         axes[1].set_title(f"Accretion rate at r = {results['r_measure']:.2f} r_g "
                           f"(2 r_horizon, a = {results['spin']:.2f})")
         if plateau.sum() > 1:
@@ -798,7 +798,10 @@ class TorusAnalysis:
                     valid = (rho_2d > 0.1) & (Q_theta < 100) & np.isfinite(Q_theta)
                     Q_masked = np.where(valid, Q_theta, np.nan)
                     with np.errstate(invalid='ignore'):
-                        Q_avg = np.nanmean(Q_masked, axis=1)
+                        valid_count = np.sum(np.isfinite(Q_masked), axis=1)
+                        Q_avg = np.full(Q_masked.shape[0], np.nan)
+                        good = valid_count > 0
+                        Q_avg[good] = np.nanmean(Q_masked[good, :], axis=1)
                     r_1d = r_2d[:, 0] if r_2d.ndim > 1 else r_2d
                 else:
                     Q_avg = Q_theta
@@ -827,8 +830,12 @@ class TorusAnalysis:
             z = r_grid * np.cos(theta_grid)
             
             # Plot alpha parameter
-            im = ax3.pcolormesh(x, z, alpha_total, cmap='RdBu_r', 
-                               vmin=-0.1, vmax=0.1, shading='gouraud')
+            # Mask to torus so vacuum NaNs don't smear the map; tighten scale to the data range
+            alpha_plot = np.where(alpha_results['mask'], alpha_total, np.nan)
+            cmap = plt.cm.RdBu_r.copy()
+            cmap.set_bad(alpha=0.0)          # NaN (vacuum) renders transparent, not grey
+            im = ax3.pcolormesh(x, z, alpha_plot, cmap=cmap,
+                                vmin=-0.05, vmax=0.05, shading='gouraud')
             cbar3 = plt.colorbar(im, ax=ax3, label='α_total')
             
             ax3.set_xlabel('X')
@@ -856,10 +863,18 @@ class TorusAnalysis:
             if alpha_total.ndim > 1:
                 r_1d = alpha_results['r_grid'][:, 0] if alpha_results['r_grid'].ndim > 1 else alpha_results['r_grid']
                 pm = alpha_results['mask']
+                alpha_total_masked = np.where(pm, alpha_total,    np.nan)
+                alpha_mag_masked   = np.where(pm, alpha_magnetic, np.nan)
+                alpha_rey_masked   = np.where(pm, alpha_reynolds, np.nan)
                 with np.errstate(invalid='ignore'):
-                    alpha_tot_avg = np.nanmean(np.where(pm, alpha_total, np.nan), axis=1)
-                    alpha_mag_avg = np.nanmean(np.where(pm, alpha_magnetic, np.nan), axis=1)
-                    alpha_rey_avg = np.nanmean(np.where(pm, alpha_reynolds, np.nan), axis=1)
+                    nrows = alpha_total_masked.shape[0]
+                    good = np.sum(np.isfinite(alpha_total_masked), axis=1) > 0
+                    alpha_tot_avg = np.full(nrows, np.nan)
+                    alpha_mag_avg = np.full(nrows, np.nan)
+                    alpha_rey_avg = np.full(nrows, np.nan)
+                    alpha_tot_avg[good] = np.nanmean(alpha_total_masked[good, :], axis=1)
+                    alpha_mag_avg[good] = np.nanmean(alpha_mag_masked[good, :],   axis=1)
+                    alpha_rey_avg[good] = np.nanmean(alpha_rey_masked[good, :],   axis=1)
             else:
                 r_1d = np.arange(len(alpha_total))
                 alpha_tot_avg = alpha_total
@@ -889,9 +904,15 @@ class TorusAnalysis:
             if omega.ndim > 1:
                 r_1d = r_grid[:, 0] if r_grid.ndim > 1 else r_grid
                 om = omega_results['mask']
+                omega_masked     = np.where(om, omega,     np.nan)
+                omega_kep_masked = np.where(om, omega_kep, np.nan)
                 with np.errstate(invalid='ignore'):
-                    omega_avg = np.nanmean(np.where(om, omega, np.nan), axis=1)
-                    omega_kep_avg = np.nanmean(np.where(om, omega_kep, np.nan), axis=1)
+                    nrows = omega_masked.shape[0]
+                    good = np.sum(np.isfinite(omega_masked), axis=1) > 0
+                    omega_avg     = np.full(nrows, np.nan)
+                    omega_kep_avg = np.full(nrows, np.nan)
+                    omega_avg[good]     = np.nanmean(omega_masked[good, :],     axis=1)
+                    omega_kep_avg[good] = np.nanmean(omega_kep_masked[good, :], axis=1)
             else:
                 r_1d = np.arange(len(omega))
                 omega_avg = omega
@@ -965,7 +986,7 @@ class TorusAnalysis:
         
         summary_text += f"\nNotes:\n"
         summary_text += f"• E_mag: volume-weighted ∫(b²/2)√g dV over torus (ρ>0.1)\n"
-        summary_text += f"• mdot: flux-integrated -∮ρu^r√g dx²dx³ at 2r₊\n"
+        summary_text += r"• $\dot{M}$: flux-integrated $-\oint \rho\, u^{r}\sqrt{-g}\, dx^{2}dx^{3}$ at $2r_+$" + "\n"
         summary_text += f"• α: orthonormal-frame T^(r̂φ̂)/p_g, signed; 'Reynolds'=hydro incl. mean-flow advection\n"
         summary_text += f"• quasi-stationary start is heuristic"
         

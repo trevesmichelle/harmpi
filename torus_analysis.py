@@ -372,13 +372,20 @@ class TorusAnalysis:
         
     def calculate_alpha_parameter(self, dump_files, quasi_start_time=None, sample_every=3):
         """
-        Calculate alpha parameter α = T^r_φ / P
-        Attempt to separate into magnetic and Reynolds contributions
-        
-        Scientific approach: Use actual tensor components, not assumptions
+        Alpha parameter from orthonormal-frame stress: α = T^{r̂φ̂} / p_gas,
+        T^{r̂φ̂} ≈ sqrt(gcov11/gcov33) * Tud[1,3] (code coords; neglects t-φ
+        frame-dragging mixing — OK for disk-body stats at r>6).
+
+        Maxwell part: -b^{r̂} b^{φ̂} ≈ -sqrt(gcov11/gcov33) * bu[1] * bd[3];
+        the remainder w*u^r*u_φ is HYDRODYNAMIC stress (mean-flow advection +
+        turbulence), NOT pure turbulent Reynolds stress.
+
+        Sign convention: positive α = outward angular-momentum transport.
+        MRI Maxwell stress should come out POSITIVE; the hydro remainder is
+        typically NEGATIVE in the inflow (inward advection of ang. momentum).
         """
         print("=== ALPHA PARAMETER ANALYSIS ===")
-        
+
         if quasi_start_time is None:
             analysis_files = dump_files
         else:
@@ -390,167 +397,119 @@ class TorusAnalysis:
                         analysis_files.append(dump_file)
                 except:
                     continue
-        
-        # Time-averaged quantities
+
         alpha_total_sum = None
         alpha_mag_sum = None
         alpha_rey_sum = None
-        beta_sum = None  # Track plasma beta
+        beta_sum = None
+        mask_count = None          # per-cell: how many snapshots cell was in torus
         count = 0
-        
+
         for dump_file in analysis_files[::sample_every]:
             try:
                 self.load_data("gdump", dump_file)
-                hs.aux()  # Calculate derived quantities
-                
-                if not hasattr(hs, 'Tud'):
-                    print(f"Warning: Stress tensor not available for {dump_file}")
+                hs.aux()
+
+                if not (hasattr(hs, 'Tud') and hasattr(hs, 'bu') and hasattr(hs, 'bd')):
+                    print(f"Warning: stress/field not available for {dump_file}")
                     continue
-                
-                # Get basic quantities
-                T_r_phi = hs.Tud[1, 3].squeeze()  # T^r_φ (TOTAL stress)
-                pg = (hs.gam - 1) * hs.ug.squeeze()  # Gas pressure
+
+                T13 = hs.Tud[1, 3].squeeze()
+                pg = (hs.gam - 1) * hs.ug.squeeze()
                 rho = hs.rho.squeeze()
                 r = hs.r.squeeze()
-                
-                # Torus mask
-                mask = (rho > 0.1) & (r > 6) & (r < 50)
-                
+
+                # Orthonormal projection factor sqrt(g_11/g_33), code coordinates
+                g11 = hs.gcov[1, 1].squeeze()
+                g33 = hs.gcov[3, 3].squeeze()
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    hat = np.sqrt(g11 / g33)
+
+                mask = (rho > 0.1) & (r > 6) & (r < 50) & np.isfinite(hat)
                 if mask.sum() == 0:
                     continue
-                
-                # Total alpha (well-defined)
-                alpha_total = np.zeros_like(T_r_phi)
-                alpha_total[mask] = -T_r_phi[mask] / (pg[mask] + 1e-20)
-                
-                # Attempt to calculate magnetic vs Reynolds separation
-                can_calculate_directly = False
-                
-                if hasattr(hs, 'bcon') and hasattr(hs, 'bcov'):
-                    try:
-                        # Magnetic stress: T^r_φ_mag = -b^r b_φ
-                        b_r_con = hs.bcon[1].squeeze()
-                        b_phi_cov = hs.bcov[3].squeeze()
-                        T_mag_r_phi = -b_r_con * b_phi_cov
-                        
-                        alpha_mag = np.zeros_like(T_r_phi)
-                        alpha_mag[mask] = T_mag_r_phi[mask] / (pg[mask] + 1e-20)
-                        
-                        # Reynolds by subtraction
-                        alpha_rey = alpha_total - alpha_mag
-                        
-                        can_calculate_directly = True
-                        
-                    except Exception as e:
-                        can_calculate_directly = False
-                
-                # If direct calculation fails, use total only
-                if not can_calculate_directly:
-                    alpha_mag = np.zeros_like(alpha_total)
-                    alpha_rey = alpha_total.copy()
-                    
-                    # Calculate plasma beta for context
-                    if hasattr(hs, 'bsq'):
-                        bsq_local = hs.bsq.squeeze()
-                        beta_local = 2 * pg / (bsq_local + 1e-20)
-                    else:
-                        beta_local = np.ones_like(pg) * 1e6
-                
-                # Time averaging
+
+                alpha_total = np.zeros_like(T13)
+                alpha_mag = np.zeros_like(T13)
+                alpha_total[mask] = (hat * T13)[mask] / (pg[mask] + 1e-20)
+                # Maxwell stress -b^r b_phi (harmpi names: bu/bd, NOT bcon/bcov)
+                T13_mag = -hs.bu[1].squeeze() * hs.bd[3].squeeze()
+                alpha_mag[mask] = (hat * T13_mag)[mask] / (pg[mask] + 1e-20)
+                alpha_rey = alpha_total - alpha_mag   # hydrodynamic remainder
+
+                # plasma beta — always computed (was trapped in a dead branch)
+                bsq_local = hs.bsq.squeeze()
+                beta_local = np.zeros_like(pg)
+                beta_local[mask] = 2 * pg[mask] / (bsq_local[mask] + 1e-20)
+
                 if alpha_total_sum is None:
                     alpha_total_sum = alpha_total.copy()
                     alpha_mag_sum = alpha_mag.copy()
                     alpha_rey_sum = alpha_rey.copy()
-                    if hasattr(hs, 'bsq'):
-                        beta_sum = beta_local.copy()
+                    beta_sum = beta_local.copy()
+                    mask_count = mask.astype(int)
                 else:
                     alpha_total_sum += alpha_total
                     alpha_mag_sum += alpha_mag
                     alpha_rey_sum += alpha_rey
-                    if hasattr(hs, 'bsq'):
-                        beta_sum += beta_local
-                
+                    beta_sum += beta_local
+                    mask_count += mask
+
                 count += 1
-                
+
             except Exception as e:
                 print(f"Error processing {dump_file}: {e}")
                 continue
-        
+
         if count > 0:
-            # Time averages
-            alpha_total_avg = alpha_total_sum / count
-            alpha_mag_avg = alpha_mag_sum / count
-            alpha_rey_avg = alpha_rey_sum / count
-            
-            if beta_sum is not None:
-                beta_avg = beta_sum / count
+            # Per-cell average over the snapshots in which the cell was in-torus
+            n = np.maximum(mask_count, 1)
+            alpha_total_avg = alpha_total_sum / n
+            alpha_mag_avg = alpha_mag_sum / n
+            alpha_rey_avg = alpha_rey_sum / n
+            beta_avg = beta_sum / n
+
+            # Robust mask: in torus for at least half the snapshots
+            mask = mask_count >= max(1, count // 2)
+
+            # SIGNED means (abs() hid the sign-convention bug)
+            alpha_tot_mean = alpha_total_avg[mask].mean()
+            alpha_mag_mean = alpha_mag_avg[mask].mean()
+            alpha_rey_mean = alpha_rey_avg[mask].mean()
+
+            denom = np.abs(alpha_mag_mean) + np.abs(alpha_rey_mean)
+            mag_fraction = np.abs(alpha_mag_mean) / (denom + 1e-20)
+            separation_valid = True
+
+            print(f"\nTime-averaged alpha parameters (signed; from {count} snapshots):")
+            print(f"  Total α          = {alpha_tot_mean:+.3f}")
+            print(f"  Maxwell α        = {alpha_mag_mean:+.3f}  (expect positive)")
+            print(f"  Hydro remainder  = {alpha_rey_mean:+.3f}  (advection+turbulence, NOT pure Reynolds)")
+            print(f"  Maxwell fraction of |stress|: {mag_fraction*100:.1f}%")
+
+            beta_median = np.median(beta_avg[mask])
+            beta_lo = np.percentile(beta_avg[mask], 10)
+            beta_hi = np.percentile(beta_avg[mask], 90)
+            print(f"\n  Plasma β in torus: median {beta_median:.1f}, 10-90% {beta_lo:.1f}-{beta_hi:.1f}")
+            if beta_median > 10:
+                print("  → gas-pressure-dominated disk body (expected for SANE/beta=100 start)")
+            elif beta_median > 1:
+                print("  → moderately magnetized")
             else:
-                beta_avg = None
-            
-            # Statistics ONLY in torus
-            mask = (rho > 0.1) & (r > 6) & (r < 50)
-            
-            # Report absolute values
-            alpha_tot_mean = np.abs(alpha_total_avg[mask]).mean()
-            alpha_mag_mean = np.abs(alpha_mag_avg[mask]).mean()
-            alpha_rey_mean = np.abs(alpha_rey_avg[mask]).mean()
-            
-            # Calculate dominance
-            if alpha_mag_mean > 1e-6:
-                total_stress = alpha_mag_mean + alpha_rey_mean
-                mag_fraction = alpha_mag_mean / (total_stress + 1e-20)
-                separation_valid = True
-            else:
-                mag_fraction = 0.0
-                separation_valid = False
-            
-            # Report results with appropriate caveats
-            print(f"\nTime-averaged alpha parameters (from {count} snapshots):")
-            print(f"  Total α = {alpha_tot_mean:.3f}")
-            
-            if separation_valid:
-                print(f"  Magnetic α = {alpha_mag_mean:.3f}")
-                print(f"  Reynolds α = {alpha_rey_mean:.3f}")
-                print(f"  Magnetic dominance: {mag_fraction*100:.1f}%")
-            else:
-                print(f"  Magnetic α = {alpha_mag_mean:.3f} (unreliable)")
-                print(f"  Reynolds α = {alpha_rey_mean:.3f} (unreliable)")
-                print(f"  WARNING: Could not reliably separate magnetic vs Reynolds stress")
-                print(f"           Report only total α = {alpha_tot_mean:.3f}")
-            
-            # Report plasma beta for physical context
-            if beta_avg is not None:
-                beta_median = np.median(beta_avg[mask])
-                beta_min = np.percentile(beta_avg[mask], 10)
-                beta_max = np.percentile(beta_avg[mask], 90)
-                
-                print(f"\n  Plasma β in torus:")
-                print(f"    Median: {beta_median:.1f}")
-                print(f"    10th-90th percentile: {beta_min:.1f} - {beta_max:.1f}")
-                
-                if beta_median > 100:
-                    print(f"  → Very weak field regime (β >> 100): Reynolds stress dominates")
-                elif beta_median > 50:
-                    print(f"  → Weak field regime (β > 50): Reynolds likely dominates")
-                elif beta_median > 10:
-                    print(f"  → Transitional regime (β ~ 10-50): Mixed stress")
-                elif beta_median > 1:
-                    print(f"  → Moderate field (β ~ 1-10): Likely mixed/magnetic dominance")
-                else:
-                    print(f"  → Strong field (β < 1): Magnetic stress should dominate")
-                        
+                print("  → magnetically dominated — check mask")
+
             results = {
                 'alpha_total': alpha_total_avg,
                 'alpha_magnetic': alpha_mag_avg,
-                'alpha_reynolds': alpha_rey_avg,
+                'alpha_reynolds': alpha_rey_avg,   # key kept; content = hydro remainder
                 'separation_valid': separation_valid,
-                'beta': beta_avg if beta_avg is not None else None,
+                'beta': beta_avg,
                 'count': count,
                 'mask': mask,
+                'mask_count': mask_count,
                 'r_grid': r,
                 'theta_grid': hs.h.squeeze()
             }
-            
             return results
         else:
             print("ERROR: No valid data for alpha calculation")
@@ -590,6 +549,8 @@ class TorusAnalysis:
                 
                 # Angular velocity Ω = u^φ / u^t
                 omega = hs.uu[3].squeeze() / (hs.uu[0].squeeze() + 1e-20)
+                # Ω = u^φ/u^t: dxdxp[3,3]=1.0 verified on this grid, so code x3 IS
+                # physical φ — no transform factor needed (unlike Qmri's general case).
                 
                 # Get coordinates
                 r = hs.r.squeeze()
@@ -606,17 +567,15 @@ class TorusAnalysis:
                 if mask.sum() == 0:
                     continue
                 
-                # Initialize ratio array
-                omega_ratio = np.zeros_like(omega)
-                omega_ratio[mask] = omega[mask] / (omega_K[mask] + 1e-20)
-                
                 # Time averaging
                 if omega_sum is None:
                     omega_sum = omega.copy()
                     omega_K_sum = omega_K.copy()
+                    mask_count = mask.astype(int)
                 else:
                     omega_sum += omega
                     omega_K_sum += omega_K
+                    mask_count += mask
                 
                 count += 1
                 
@@ -629,7 +588,7 @@ class TorusAnalysis:
             omega_K_avg = omega_K_sum / count
             
             # Calculate ratio ONLY in disk
-            mask = (rho > 0.1) & (r > 6) & (r < 50) & (np.abs(th - np.pi/2) < 0.3)
+            mask = mask_count >= max(1, count // 2)   # in disk midplane ≥ half the snapshots
             
             omega_ratio = np.zeros_like(omega_avg)
             omega_ratio[mask] = omega_avg[mask] / (omega_K_avg[mask] + 1e-20)
@@ -654,6 +613,7 @@ class TorusAnalysis:
                 'omega_ratio': omega_ratio,
                 'count': count,
                 'mask': mask,
+                'mask_count': mask_count,
                 'r_grid': r,
                 'theta_grid': th
             }
@@ -895,19 +855,23 @@ class TorusAnalysis:
             # Radial profiles (theta-averaged)
             if alpha_total.ndim > 1:
                 r_1d = alpha_results['r_grid'][:, 0] if alpha_results['r_grid'].ndim > 1 else alpha_results['r_grid']
-                alpha_tot_avg = alpha_total.mean(axis=1)
-                alpha_mag_avg = alpha_magnetic.mean(axis=1)
-                alpha_rey_avg = alpha_reynolds.mean(axis=1)
+                pm = alpha_results['mask']
+                with np.errstate(invalid='ignore'):
+                    alpha_tot_avg = np.nanmean(np.where(pm, alpha_total, np.nan), axis=1)
+                    alpha_mag_avg = np.nanmean(np.where(pm, alpha_magnetic, np.nan), axis=1)
+                    alpha_rey_avg = np.nanmean(np.where(pm, alpha_reynolds, np.nan), axis=1)
             else:
                 r_1d = np.arange(len(alpha_total))
                 alpha_tot_avg = alpha_total
                 alpha_mag_avg = alpha_magnetic
                 alpha_rey_avg = alpha_reynolds
             
-            ax5.semilogx(r_1d, alpha_tot_avg, 'k-', linewidth=3, label='Total')
-            ax5.semilogx(r_1d, alpha_mag_avg, 'r-', linewidth=2, label='Magnetic')
-            ax5.semilogx(r_1d, alpha_rey_avg, 'b-', linewidth=2, label='Reynolds')
+            ax5.plot(r_1d, alpha_tot_avg, 'k-', linewidth=3, label='Total')
+            ax5.plot(r_1d, alpha_mag_avg, 'r-', linewidth=2, label='Magnetic')
+            ax5.plot(r_1d, alpha_rey_avg, 'b-', linewidth=2, label='Hydro (advection+turb.)')
             
+            ax5.set_xlim(5, 55)
+            ax5.axhline(0, color='gray', lw=0.8)
             ax5.set_xlabel('Radius')
             ax5.set_ylabel('Alpha Parameter')
             ax5.set_title('Alpha Components vs Radius')
@@ -924,8 +888,10 @@ class TorusAnalysis:
             # Theta-averaged profiles
             if omega.ndim > 1:
                 r_1d = r_grid[:, 0] if r_grid.ndim > 1 else r_grid
-                omega_avg = omega.mean(axis=1)
-                omega_kep_avg = omega_kep.mean(axis=1)
+                om = omega_results['mask']
+                with np.errstate(invalid='ignore'):
+                    omega_avg = np.nanmean(np.where(om, omega, np.nan), axis=1)
+                    omega_kep_avg = np.nanmean(np.where(om, omega_kep, np.nan), axis=1)
             else:
                 r_1d = np.arange(len(omega))
                 omega_avg = omega
@@ -998,9 +964,9 @@ class TorusAnalysis:
             summary_text += f"Ω/Ω_K ratio: {omega_ratio_mean:.2f}\n"
         
         summary_text += f"\nNotes:\n"
-        summary_text += f"• b^2, u^0, rho values are proxies (not volume-weighted)\n"
-        summary_text += f"• alpha from masked torus cells\n"
-        summary_text += f"• mdot proxy = mean rho at r<10, not flux-integrated\n"
+        summary_text += f"• E_mag: volume-weighted ∫(b²/2)√g dV over torus (ρ>0.1)\n"
+        summary_text += f"• mdot: flux-integrated -∮ρu^r√g dx²dx³ at 2r₊\n"
+        summary_text += f"• α: orthonormal-frame T^(r̂φ̂)/p_g, signed; 'Reynolds'=hydro incl. mean-flow advection\n"
         summary_text += f"• quasi-stationary start is heuristic"
         
         ax8.text(0.05, 0.95, summary_text, transform=ax8.transAxes, 

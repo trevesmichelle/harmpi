@@ -188,7 +188,7 @@ class TorusAnalysis:
 
         # Left: 2D spatial map of Q_theta in poloidal plane
         im = axes[0].pcolormesh(R, z, Q_masked, cmap="viridis",
-                                vmin=0, vmax=20, shading="auto")
+                                vmin=0, vmax=20, shading="gouraud")
         axes[0].set_xlabel("R [r_g]")
         axes[0].set_ylabel("z [r_g]")
         axes[0].set_title(f"Q_theta map (torus cells only), {dump_file}")
@@ -828,7 +828,7 @@ class TorusAnalysis:
             
             # Plot alpha parameter
             im = ax3.pcolormesh(x, z, alpha_total, cmap='RdBu_r', 
-                               vmin=-0.1, vmax=0.1, shading='auto')
+                               vmin=-0.1, vmax=0.1, shading='gouraud')
             cbar3 = plt.colorbar(im, ax=ax3, label='α_total')
             
             ax3.set_xlabel('X')
@@ -940,13 +940,13 @@ class TorusAnalysis:
             # FIXED: Use masked values, not entire array
             if 'mask' in alpha_results:
                 mask = alpha_results['mask']
-                alpha_mean = np.abs(alpha_results['alpha_total'][mask]).mean()
-                alpha_mag = np.abs(alpha_results['alpha_magnetic'][mask]).mean()
-                alpha_rey = np.abs(alpha_results['alpha_reynolds'][mask]).mean()
+                alpha_mean = alpha_results['alpha_total'][mask].mean()
+                alpha_mag = alpha_results['alpha_magnetic'][mask].mean()
+                alpha_rey = alpha_results['alpha_reynolds'][mask].mean()
             else:
-                alpha_mean = np.nanmean(np.abs(alpha_results['alpha_total']))
-                alpha_mag = np.nanmean(np.abs(alpha_results['alpha_magnetic']))
-                alpha_rey = np.nanmean(np.abs(alpha_results['alpha_reynolds']))
+                alpha_mean = np.nanmean(alpha_results['alpha_total'])
+                alpha_mag = np.nanmean(alpha_results['alpha_magnetic'])
+                alpha_rey = np.nanmean(alpha_results['alpha_reynolds'])
             summary_text += f"Alpha Parameter: α_total = {alpha_mean:.3f}\n"
             summary_text += f"  α_magnetic = {alpha_mag:.3f}\n"
             summary_text += f"  α_reynolds = {alpha_rey:.3f}\n"
@@ -1281,18 +1281,18 @@ def main():
         # FIXED: Use masked values, not entire array
         if 'mask' in alpha_results:
             mask = alpha_results['mask']
-            alpha_mean = np.abs(alpha_results['alpha_total'][mask]).mean()
-            alpha_mag = np.abs(alpha_results['alpha_magnetic'][mask]).mean()
-            alpha_rey = np.abs(alpha_results['alpha_reynolds'][mask]).mean()
+            alpha_mean = alpha_results['alpha_total'][mask].mean()
+            alpha_mag = alpha_results['alpha_magnetic'][mask].mean()
+            alpha_rey = alpha_results['alpha_reynolds'][mask].mean()
         else:
-            alpha_mean = np.nanmean(np.abs(alpha_results['alpha_total']))
-            alpha_mag = np.nanmean(np.abs(alpha_results['alpha_magnetic']))
-            alpha_rey = np.nanmean(np.abs(alpha_results['alpha_reynolds']))
+            alpha_mean = np.nanmean(alpha_results['alpha_total'])
+            alpha_mag = np.nanmean(alpha_results['alpha_magnetic'])
+            alpha_rey = np.nanmean(alpha_results['alpha_reynolds'])
         print(f"\nAlpha Parameters:")
         print(f"  Total α = {alpha_mean:.3f}")
         print(f"  Magnetic α = {alpha_mag:.3f}")
         print(f"  Reynolds α = {alpha_rey:.3f}")
-        print(f"  Magnetic dominance: {alpha_mag/(alpha_mag+alpha_rey)*100:.1f}%")
+        print(f"  Magnetic dominance: {abs(alpha_mag)/(abs(alpha_mag)+abs(alpha_rey))*100:.1f}%")
     
     if vertical_alpha_results:
         # FIXED: Use masked values

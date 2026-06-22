@@ -759,7 +759,14 @@ class TorusAnalysis:
     def plot_comprehensive_analysis(self, evolution_results, alpha_results, omega_results, 
                                    mri_results, show=True):
         """Create comprehensive analysis plots"""
-        
+        # consistent type hierarchy: titles > labels > ticks (was inverted)
+        plt.rcParams.update({
+            'axes.titlesize':  13,
+            'axes.labelsize':  11,
+            'xtick.labelsize':  9,
+            'ytick.labelsize':  9,
+            'legend.fontsize':  9,
+        })
         fig = plt.figure(figsize=(18, 12))
         gs = GridSpec(3, 3, figure=fig, hspace=0.35, wspace=0.25)
         
@@ -842,6 +849,8 @@ class TorusAnalysis:
             ax3.set_ylabel('Z')
             ax3.set_title('Alpha Parameter Map')
             ax3.set_aspect('equal')
+            ax3.set_xlim(0, 50)
+            ax3.set_ylim(-40, 40)
         
         # 4. Mass accretion rate evolution
         ax4 = fig.add_subplot(gs[1, 0])
